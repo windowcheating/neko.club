@@ -1,0 +1,214 @@
+-- esp/footsteps.lua — Footstep trails (neon foot + toe prints)
+local API = {}
+
+local C = {
+    Innocent = Color3.fromHex("#B1FFB1"),
+    Murderer = Color3.fromHex("#FF7272"),
+    Sheriff  = Color3.fromHex("#ACD7FF"),
+}
+
+local enabled = false
+local heartbeatConn
+local roleFetchThread
+
+local prints = {}
+local last = setmetatable({}, { __mode = "k" })
+local side = setmetatable({}, { __mode = "k" })
+local folder = nil
+local LIFE = 8
+local AT = 0
+local RAY = RaycastParams.new()
+RAY.FilterType = Enum.RaycastFilterType.Exclude
+
+local roleCache = {}
+
+local function fetchRoles()
+    local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+    local extras = remotes and remotes:FindFirstChild("Extras")
+    local getPlayerData = extras and extras:FindFirstChild("GetPlayerData")
+    if not getPlayerData then return end
+    local ok, data = pcall(function() return getPlayerData:InvokeServer() end)
+    if ok and type(data) == "table" then
+        for name, info in pairs(data) do
+            if type(info) == "table" and info.Role then
+                roleCache[name] = info.Role
+            end
+        end
+    end
+end
+
+local function getMurderer()
+    for name, role in pairs(roleCache) do
+        if role == "Murderer" then
+            local p = game.Players:FindFirstChild(name)
+            if p then return p end
+        end
+    end
+    for _, p in ipairs(game.Players:GetPlayers()) do
+        local bp = p:FindFirstChildOfClass("Backpack")
+        if bp and bp:FindFirstChild("Knife") then return p end
+        if p.Character and p.Character:FindFirstChild("Knife") then return p end
+    end
+    return nil
+end
+
+local function getSheriff()
+    for name, role in pairs(roleCache) do
+        if role == "Sheriff" then
+            local p = game.Players:FindFirstChild(name)
+            if p then return p end
+        end
+    end
+    for _, p in ipairs(game.Players:GetPlayers()) do
+        local bp = p:FindFirstChildOfClass("Backpack")
+        if bp and bp:FindFirstChild("Gun") then return p end
+        if p.Character and p.Character:FindFirstChild("Gun") then return p end
+    end
+    return nil
+end
+
+local function fsTint(role)
+    if role == "Murderer" then return C.Murderer end
+    if role == "Sheriff" then return C.Sheriff end
+    return C.Innocent
+end
+
+local function fsClear()
+    for i = #prints, 1, -1 do
+        local e = prints[i]
+        pcall(function() e.part:Destroy() end)
+        if e.toe then pcall(function() e.toe:Destroy() end) end
+        prints[i] = nil
+    end
+    table.clear(last)
+    table.clear(side)
+    if folder then pcall(function() folder:Destroy() end); folder = nil end
+end
+
+local function fsDrop(cf, col)
+    if #prints >= 220 then
+        local old = table.remove(prints, 1)
+        if old then
+            pcall(function() old.part:Destroy() end)
+            if old.toe then pcall(function() old.toe:Destroy() end) end
+        end
+    end
+    if not (folder and folder.Parent) then
+        folder = Instance.new("Folder")
+        folder.Name = "AirFlowFootsteps"
+        folder.Parent = workspace
+    end
+    local part = Instance.new("Part")
+    part.Name = "FS_" .. math.random(1000, 9999)
+    part.Anchored = true; part.CanCollide = false
+    part.CanQuery = false; part.CanTouch = false; part.CastShadow = false
+    part.Size = Vector3.new(0.4, 0.07, 0.66)
+    part.Material = Enum.Material.Neon
+    part.Color = col; part.Transparency = 0.15
+    part.CFrame = cf; part.Parent = folder
+    local sm = Instance.new("SpecialMesh", part)
+    sm.MeshType = Enum.MeshType.Sphere
+
+    local toe = Instance.new("Part")
+    toe.Name = "Toe_" .. math.random(1000, 9999)
+    toe.Anchored = true; toe.CanCollide = false
+    toe.CanQuery = false; toe.CanTouch = false; toe.CastShadow = false
+    toe.Size = Vector3.new(0.26, 0.06, 0.2)
+    toe.Material = Enum.Material.Neon
+    toe.Color = col; toe.Transparency = 0.15
+    toe.CFrame = cf * CFrame.new(0, 0, -0.46)
+    toe.Parent = folder
+    local sm2 = Instance.new("SpecialMesh", toe)
+    sm2.MeshType = Enum.MeshType.Sphere
+
+    prints[#prints + 1] = { part = part, toe = toe, born = os.clock() }
+end
+
+local function heartbeat()
+    local now = os.clock()
+    for i = #prints, 1, -1 do
+        local e = prints[i]
+        local age = now - e.born
+        if age >= LIFE or not e.part.Parent then
+            pcall(function() e.part:Destroy() end)
+            if e.toe then pcall(function() e.toe:Destroy() end) end
+            table.remove(prints, i)
+        else
+            local t = 0.15 + 0.85 * (age / LIFE)
+            e.part.Transparency = t
+            if e.toe then e.toe.Transparency = t end
+        end
+    end
+    if now - AT < 0.08 then return end
+    AT = now
+
+    local me = game.Players.LocalPlayer.Character
+    local murderer = getMurderer()
+    local sheriff = getSheriff()
+
+    for _, plr in ipairs(game.Players:GetPlayers()) do
+        if plr ~= game.Players.LocalPlayer and plr.Character then
+            local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
+            local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+            if hrp and hum and hum.Health > 0 then
+                local pos = hrp.Position
+                local prev = last[plr]
+                if not prev then
+                    last[plr] = pos
+                elseif (pos - prev).Magnitude >= 3.5 then
+                    last[plr] = pos
+                    RAY.FilterDescendantsInstances = { plr.Character, me, folder }
+                    local hit = workspace:Raycast(pos, Vector3.new(0, -8, 0), RAY)
+                    if hit then
+                        local n = hit.Normal
+                        local travel = pos - prev
+                        local look = (travel.Magnitude > 0.5) and travel.Unit or hrp.CFrame.LookVector
+                        local fwd = look - n * look:Dot(n)
+                        fwd = (fwd.Magnitude > 1e-3) and fwd.Unit or Vector3.new(0, 0, -1)
+                        local sideVec = fwd:Cross(n)
+                        side[plr] = not side[plr]
+                        local base = hit.Position + sideVec * (side[plr] and 0.3 or -0.3) + n * 0.045
+                        local role = (plr == murderer) and "Murderer" or ((plr == sheriff) and "Sheriff" or "Innocent")
+                        fsDrop(CFrame.lookAt(base, base + fwd, n), fsTint(role))
+                    end
+                end
+            end
+        end
+    end
+end
+
+function API:Enable()
+    if enabled then return end
+    enabled = true
+
+    roleFetchThread = task.spawn(function()
+        while enabled do
+            fetchRoles()
+            task.wait(1)
+        end
+    end)
+
+    heartbeatConn = game:GetService("RunService").Heartbeat:Connect(heartbeat)
+end
+
+function API:Disable()
+    if not enabled then return end
+    enabled = false
+
+    if heartbeatConn then heartbeatConn:Disconnect(); heartbeatConn = nil end
+    fsClear()
+end
+
+function API:Toggle()
+    if enabled then self:Disable() else self:Enable() end
+end
+
+function API:IsEnabled()
+    return enabled
+end
+
+function API:Destroy()
+    self:Disable()
+end
+
+return API
