@@ -1,0 +1,636 @@
+-- sheriff.lua — raw Sheriff feature module (no UI, no toggles)
+-- Includes: Silent Aim, Adaptive Lead, Hit Chams, Damage Indicators, Tracers, Hitsounds.
+
+local API = {}
+
+local Services = {
+    Players           = game:GetService("Players"),
+    RunService        = game:GetService("RunService"),
+    UserInputService  = game:GetService("UserInputService"),
+    ReplicatedStorage = game:GetService("ReplicatedStorage"),
+    SoundService      = game:GetService("SoundService"),
+    TweenService      = game:GetService("TweenService"),
+    Lighting          = game:GetService("Lighting"),
+    CoreGui           = game:GetService("CoreGui"),
+}
+local LocalPlayer = Services.Players.LocalPlayer
+local tick = tick or os.clock
+
+local DEFAULT_ACCENT = Color3.fromHex and Color3.fromHex("#9791df") or Color3.fromRGB(0x97, 0x91, 0xdf)
+
+local function getRealPing()
+    local ping = 50
+    pcall(function()
+        ping = Services.Players.LocalPlayer:GetNetworkPing() * 1000
+        if ping < 0 then ping = 0 end
+    end)
+    return math.floor(ping + 0.5)
+end
+
+-- ============================================================
+-- STATE
+-- ============================================================
+local S = {
+    SilentAimEnabled   = true,
+    SilentAimWallCheck = false,
+    ShootingMethod     = "New (blatant)",
+    AutoGrabGun        = false,
+    AdaptiveLead       = false,
+    PingCompensation   = 1.0,
+    BulletSpeed        = 2800,
+    PredictionPing     = 50,
+    AutoPrediction     = true,
+    AutoPredBeta       = false,
+    AutoPredBetaBuffer = 18,
+    
+    -- Hit FX State
+    HitChamsEnabled    = true,
+    HitChamsColor      = DEFAULT_ACCENT,
+    HitChamsDuration   = 2.5,
+    
+    DamageIndicatorEnabled = true,
+    DamageIndicatorStyle   = "Phantom Forces",
+    DamageIndicatorColor   = DEFAULT_ACCENT,
+    
+    BulletTracers      = true,
+    TracerColor        = DEFAULT_ACCENT,
+    TracerType         = "Default",
+    TracerLifetime     = 5.5,
+    TracerWidth        = 0.1,
+    
+    HitSoundEnabled    = true,
+    HitSoundId         = "https://files.catbox.moe/bgy8au.ogg",
+    HitSoundVolume     = 50,
+    
+    HitEffectEnabled   = true,
+    HitEffectType      = "Blood Splatter",
+    HitEffectColor     = DEFAULT_ACCENT,
+    HitEffectDuration  = 1.5,
+
+    Keybinds = {
+        Shoot   = Enum.KeyCode.E,
+        GrabGun = Enum.KeyCode.Y,
+        Throw   = Enum.KeyCode.U,
+    },
+    
+    SilentAimLastHealth = nil,
+}
+
+-- ============================================================
+-- SHARED LOGIC (Roles, Targets, Combat Data)
+-- ============================================================
+local roleCache = {}
+local function fetchRoles()
+    local ok, data = pcall(function()
+        local remote = Services.ReplicatedStorage:FindFirstChild("GetPlayerData", true)
+        if remote then return remote:InvokeServer() end
+    end)
+    if ok and type(data) == "table" then
+        for k, v in pairs(data) do roleCache[k] = v end
+    end
+end
+
+local function getMurderer()
+    for _, pl in ipairs(Services.Players:GetPlayers()) do
+        if pl ~= LocalPlayer then
+            if (pl.Character and pl.Character:FindFirstChild("Knife"))
+                or (pl.Backpack and pl.Backpack:FindFirstChild("Knife")) then
+                return pl
+            end
+        end
+    end
+    for name, data in pairs(roleCache) do
+        if type(data) == "table" and data.Role == "Murderer" then
+            local pl = Services.Players:FindFirstChild(name)
+            if pl then return pl end
+        end
+    end
+    return nil
+end
+
+local function resolveTarget()
+    local murderer = getMurderer()
+    if murderer and murderer.Character and murderer.Character:FindFirstChild("HumanoidRootPart") then
+        return murderer
+    end
+    local best, bestDist = nil, math.huge
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return nil end
+    for _, pl in ipairs(Services.Players:GetPlayers()) do
+        if pl ~= LocalPlayer and pl.Character then
+            local root = pl.Character:FindFirstChild("HumanoidRootPart")
+            local hum = pl.Character:FindFirstChildOfClass("Humanoid")
+            if root and hum and hum.Health > 0 then
+                local d = (root.Position - myRoot.Position).Magnitude
+                if d < bestDist then bestDist, best = d, pl end
+            end
+        end
+    end
+    return best
+end
+
+local function getCombatData()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local myHRP = char:FindFirstChild("HumanoidRootPart")
+    local arm = char:FindFirstChild("Right Arm") or char:FindFirstChild("RightHand")
+    if not myHRP or not arm then return nil end
+
+    local target = resolveTarget()
+    if not target or not target.Character then return nil end
+    local root = target.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+
+    local vel   = root.AssemblyLinearVelocity or Vector3.new(0,0,0)
+    local dist  = (root.Position - myHRP.Position).Magnitude
+    local ping  = getRealPing() / 1000
+    local travel = dist / S.BulletSpeed
+    local serverTick = 1/60
+
+    local speedBonus = math.clamp(vel.Magnitude / 20, 0, 0.05)
+    local jumpBonus  = 0
+    if vel.Y > 2 then jumpBonus = 0.02 end
+
+    local velLead = (vel.Magnitude / 100) * 0.05
+    if S.AdaptiveLead then
+        local pingFactor = (ping * 1000) / 50
+        velLead = velLead * pingFactor * S.PingCompensation
+    end
+
+    local basePred = S.PredictionPing / 1000
+    local totalLead = travel + ping + serverTick + speedBonus + jumpBonus + basePred + velLead
+    local targetPos = root.Position + (vel * totalLead)
+
+    local originPos
+    if S.ShootingMethod == "New (blatant)" then
+        originPos = root.Position + Vector3.new(0, 0.5, -0.6)
+        targetPos = targetPos + (vel * 0.02)
+    else
+        originPos = arm.Position
+        targetPos = targetPos + Vector3.new(0, dist/140, 0)
+    end
+    return root, originPos, targetPos, target
+end
+
+local function isWallBetween(originPos, targetPos, targetChar)
+    local myChar = LocalPlayer.Character
+    if not myChar then return false end
+    local myHead = myChar:FindFirstChild("Head")
+    if not myHead then return false end
+
+    local params = RaycastParams.new()
+    params.FilterDescendantsInstances = { myChar, targetChar, workspace.CurrentCamera }
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.IgnoreWater = true
+
+    local result = workspace:Raycast(myHead.Position, targetPos - myHead.Position, params)
+    if not result then return false end
+    local hitPart = result.Instance
+    if hitPart then
+        if hitPart.CanCollide == false or hitPart.Transparency >= 0.95 then return false end
+        local model = hitPart:FindFirstAncestorOfClass("Model")
+        if model and (Services.Players:GetPlayerFromCharacter(model) or model == targetChar) then
+            return false
+        end
+    end
+    return true
+end
+
+-- ============================================================
+-- HIT FX: CHAMS
+-- ============================================================
+local chamFolder = Instance.new("Folder", workspace)
+chamFolder.Name = "Sheriff_HitChams"
+
+local function createHitChams(character, color, duration)
+    if not character then return end
+    local model = Instance.new("Model")
+    model.Name = "hit_cham"
+    
+    local function dress(part, srcPart)
+        part.CanCollide = false; part.CanTouch = false; part.CanQuery = false
+        part.Massless = true; part.Material = Enum.Material.Neon; part.Color = color; part.Transparency = 0
+        part.Parent = model
+        part.CFrame = srcPart.CFrame
+        part.Anchored = true
+        
+        task.spawn(function()
+            task.wait(duration)
+            if not (part and part.Parent) then return end
+            Services.TweenService:Create(part, TweenInfo.new(0.5), {Transparency = 1}):Play()
+            task.wait(0.5)
+            if part and part.Parent then part:Destroy() end
+        end)
+    end
+
+    local whitelist = {
+        "Head","Torso","UpperTorso","LowerTorso","LeftArm","RightArm","LeftLeg","RightLeg",
+        "LeftUpperArm","LeftLowerArm","LeftHand","RightUpperArm","RightLowerArm","RightHand",
+        "LeftUpperLeg","LeftLowerLeg","LeftFoot","RightUpperLeg","RightLowerLeg","RightFoot",
+    }
+    local set = {}
+    for _, n in ipairs(whitelist) do set[n] = true end
+
+    for _, obj in ipairs(character:GetChildren()) do
+        if obj:IsA("BasePart") and set[obj.Name] then
+            local clone = Instance.new("Part")
+            clone.Size = obj.Size
+            clone.Shape = Enum.PartType.Block
+            dress(clone, obj)
+        end
+    end
+    model.Parent = chamFolder
+    task.delay(duration + 0.6, function() if model and model.Parent then model:Destroy() end end)
+end
+
+-- ============================================================
+-- HIT FX: TRACERS
+-- ============================================================
+local tracerFolder = Instance.new("Folder", workspace.CurrentCamera)
+tracerFolder.Name = "Sheriff_Tracers"
+local activeTracers = {}
+
+local function createTracer(from, to)
+    if not S.BulletTracers then return end
+    
+    local startPart = Instance.new("Part")
+    startPart.Size = Vector3.new(0, 0, 0); startPart.Transparency = 1
+    startPart.CanCollide = false; startPart.Anchored = true; startPart.Massless = true
+    startPart.CFrame = CFrame.new(from); startPart.Parent = tracerFolder
+
+    local endPart = Instance.new("Part")
+    endPart.Size = Vector3.new(0, 0, 0); endPart.Transparency = 1
+    endPart.CanCollide = false; endPart.CanQuery = false; endPart.Anchored = true; endPart.Massless = true
+    endPart.CFrame = CFrame.new(to); endPart.Parent = tracerFolder
+
+    local a0 = Instance.new("Attachment", startPart)
+    local a1 = Instance.new("Attachment", endPart)
+    local beam = Instance.new("Beam", startPart)
+    beam.Attachment0 = a0; beam.Attachment1 = a1
+    beam.FaceCamera = true; beam.LightEmission = 1; beam.LightInfluence = 0
+    beam.Color = ColorSequence.new(S.TracerColor)
+    beam.Width0 = S.TracerWidth; beam.Width1 = S.TracerWidth
+    beam.Texture = "rbxassetid://446111271"
+    beam.TextureMode = Enum.TextureMode.Wrap; beam.TextureLength = 3; beam.TextureSpeed = 3
+    beam.Transparency = NumberSequence.new(0); beam.ZOffset = 0
+
+    table.insert(activeTracers, {
+        startPart = startPart, endPart = endPart, beam = beam,
+        createdAt = tick(), lifetime = S.TracerLifetime,
+    })
+end
+
+Services.RunService.Heartbeat:Connect(function()
+    local now = tick()
+    for i = #activeTracers, 1, -1 do
+        local tr = activeTracers[i]
+        local p = (now - tr.createdAt) / tr.lifetime
+        if p >= 1 then
+            if tr.startPart and tr.startPart.Parent then tr.startPart:Destroy() end
+            if tr.endPart and tr.endPart.Parent then tr.endPart:Destroy() end
+            table.remove(activeTracers, i)
+        else
+            if tr.beam and tr.beam.Parent then
+                tr.beam.Transparency = NumberSequence.new(p)
+                tr.beam.Color = ColorSequence.new(S.TracerColor)
+                tr.beam.Width0 = S.TracerWidth; tr.beam.Width1 = S.TracerWidth
+            end
+        end
+    end
+end)
+
+-- ============================================================
+-- HIT FX: DAMAGE INDICATOR & EFFECTS
+-- ============================================================
+local fxGui = Instance.new("ScreenGui", Services.CoreGui)
+fxGui.Name = "Sheriff_FX"; fxGui.ResetOnSpawn = false
+
+local function showDamageIndicator(amount, worldPos)
+    if not S.DamageIndicatorEnabled or not worldPos then return end
+    
+    -- Phantom Forces Style
+    local attach = Instance.new("Attachment")
+    attach.WorldPosition = worldPos; attach.Parent = workspace.Terrain
+
+    local billboard = Instance.new("BillboardGui", fxGui)
+    billboard.Size = UDim2.new(0, 150, 0, 60); billboard.AlwaysOnTop = true
+    billboard.Adornee = attach
+
+    local label = Instance.new("TextLabel", billboard)
+    label.Text = tostring(math.floor(amount))
+    label.TextColor3 = S.DamageIndicatorColor
+    label.TextSize = 26; label.Font = Enum.Font.GothamBold
+    label.Size = UDim2.new(1, 0, 1, 0); label.BackgroundTransparency = 1
+    label.Position = UDim2.new(0.5, -1, 0.5, -10); label.AnchorPoint = Vector2.new(0.5, 0.5)
+
+    local shadow = label:Clone()
+    shadow.TextColor3 = Color3.fromRGB(67, 67, 67)
+    shadow.Position = UDim2.new(0.5, 0, 0.5, -9)
+    shadow.ZIndex = 1; label.ZIndex = 2; shadow.Parent = billboard
+    
+    local stroke = Instance.new("UIStroke", shadow)
+    stroke.Thickness = 1.5; stroke.Color = Color3.new(0,0,0)
+
+    local targetOffset = Vector3.new(math.random(-10,10), math.random(3,6), math.random(-10,10))
+    
+    task.spawn(function()
+        local life = 1.35
+        Services.TweenService:Create(billboard, TweenInfo.new(0.04), { Size = UDim2.new(0, 150, 0, 60) }):Play()
+        local t = 0
+        while t < life do
+            t = t + task.wait()
+            local p = t / life
+            billboard.StudsOffset = Vector3.new(0,0,0):Lerp(targetOffset, math.sin(p * math.pi/2))
+            if p > 0.5 then
+                local fade = (p - 0.5) / 0.5
+                label.TextTransparency = fade; shadow.TextTransparency = fade; stroke.Transparency = fade
+            end
+        end
+        billboard:Destroy(); attach:Destroy()
+    end)
+end
+
+local AURA_IDS = {
+    starlight = "rbxassetid://134645216613107", heavenly = "rbxassetid://139300897520961",
+    ribbon = "rbxassetid://132069507632161", sakura = "rbxassetid://81755778619404",
+    angel = "rbxassetid://97658130917593", wind = "rbxassetid://80694081850877",
+    flow = "rbxassetid://119913533725648", star = "rbxassetid://73754563740680",
+}
+
+local function createHitEffect(character)
+    if not S.HitEffectEnabled then return end
+    local root = character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Head")
+    if not root then return end
+
+    if S.HitEffectType == "Blood Splatter" then
+        local bloodColor = S.HitEffectColor
+        if bloodColor == Color3.new(1,1,1) then bloodColor = Color3.fromRGB(120, 10, 10) end
+        
+        for i = 1, 12 do
+            task.spawn(function()
+                local part = Instance.new("Part")
+                part.Size = Vector3.new(0.12, 0.12, 0.12); part.Color = bloodColor
+                part.Material = Enum.Material.Neon; part.Anchored = true; part.Parent = workspace
+                local a0 = Instance.new("Attachment", part); a0.Position = Vector3.new(0, 0.12, 0)
+                local a1 = Instance.new("Attachment", part); a1.Position = Vector3.new(0, -0.12, 0)
+                local trail = Instance.new("Trail")
+                trail.Attachment0 = a0; trail.Attachment1 = a1
+                trail.Color = ColorSequence.new(bloodColor); trail.Lifetime = 0.25
+                trail.FaceCamera = true; trail.Parent = part
+                
+                local vel = Vector3.new(math.random(-20,20), math.random(10,30), math.random(-20,20))
+                local pos = root.Position
+                part.CFrame = CFrame.new(pos)
+                
+                local elapsed = 0
+                while elapsed < 1.8 do
+                    elapsed = elapsed + 0.016; vel = vel + Vector3.new(0, -0.8, 0)
+                    local nextPos = pos + vel * 0.016
+                    local hit = workspace:Raycast(pos, nextPos - pos, RaycastParams.new())
+                    if hit then break end
+                    part.CFrame = CFrame.lookAt(pos, nextPos)
+                    task.wait(); pos = nextPos
+                end
+                trail.Enabled = false; task.wait(0.3); part:Destroy()
+            end)
+        end
+    else
+        local id = AURA_IDS[S.HitEffectType]; if not id then return end
+        local ok, template = pcall(function() return game:GetObjects(id)[1] end)
+        if not ok or not template then return end
+        
+        local clone = template:Clone(); clone.Parent = workspace
+        for _, d in ipairs(clone:GetDescendants()) do
+            if d:IsA("PointLight") then d.Color = S.HitEffectColor
+            elseif d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail") then d.Color = ColorSequence.new(S.HitEffectColor) end
+        end
+        
+        local particles = {}
+        for _, child in ipairs(clone:GetChildren()) do
+            local attach = character:FindFirstChild(child.Name) or root
+            if child:IsA("BasePart") then
+                child.CFrame = attach.CFrame; child.Anchored = true; child.Transparency = 1
+                for _, d in ipairs(child:GetDescendants()) do
+                    if d:IsA("ParticleEmitter") then d.LockedToPart = false; table.insert(particles, d) end
+                end
+            else
+                local anchor = Instance.new("Part", clone)
+                anchor.Size = Vector3.new(0.1,0.1,0.1); anchor.CFrame = attach.CFrame
+                anchor.Transparency = 1; anchor.Anchored = true
+                child.Parent = anchor
+                for _, d in ipairs(child:GetDescendants()) do
+                    if d:IsA("ParticleEmitter") then d.LockedToPart = false; table.insert(particles, d) end
+                end
+            end
+        end
+        for _, p in ipairs(particles) do pcall(function() p:Emit(25) end) end
+        task.delay(S.HitEffectDuration + 1, function() if clone then clone:Destroy() end end)
+    end
+end
+
+-- ============================================================
+-- HIT FX: SOUND
+-- ============================================================
+local hitSoundGroup = Instance.new("SoundGroup", Services.SoundService)
+hitSoundGroup.Name = "Sheriff_HitSoundGroup"; hitSoundGroup.Volume = 10
+
+local hitSound = Instance.new("Sound", Services.SoundService)
+hitSound.Name = "Sheriff_HitSound"; hitSound.SoundGroup = hitSoundGroup
+hitSound.RollOffMode = Enum.RollOffMode.Inverse; hitSound.RollOffMaxDistance = 500
+
+local function playHitSound()
+    if not S.HitSoundEnabled then return end
+    local id = tostring(S.HitSoundId)
+    if id == "" then return end
+
+    hitSound.Volume = 5 * ((S.HitSoundVolume / 100) * 3.5)
+    if id:find("^http") then
+        task.spawn(function()
+            local path = "NLAssets/" .. id:gsub("[^%w]", "") .. ".ogg"
+            if not isfolder("NLAssets") then makefolder("NLAssets") end
+            if not isfile(path) then
+                local ok, body = pcall(function() return game:HttpGet(id) end)
+                if ok and body and not body:find("404") then writefile(path, body) end
+            end
+            if isfile(path) then
+                local asset = getcustomasset(path)
+                if asset then hitSound.SoundId = asset; hitSound:Play() end
+            end
+        end)
+    else
+        hitSound.SoundId = "rbxassetid://" .. id:gsub("rbxassetid://", "")
+        hitSound:Play()
+    end
+end
+
+-- ============================================================
+-- SILENT AIM EXECUTION
+-- ============================================================
+local function fireSilentAim()
+    if not S.SilentAimEnabled then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    local gun = char:FindFirstChild("Gun") or (LocalPlayer.Backpack and LocalPlayer.Backpack:FindFirstChild("Gun"))
+    if not gun then return end
+    if gun.Parent ~= char then char.Humanoid:EquipTool(gun); task.wait(0.05) end
+
+    local root, originPos, targetPos, targetPlayer = getCombatData()
+    if not root or not originPos or not targetPos or not targetPlayer then return end
+    if S.SilentAimWallCheck and isWallBetween(originPos, targetPos, root.Parent) then return end
+
+    local remote = gun:FindFirstChild("Shoot") or Services.ReplicatedStorage:FindFirstChild("ShootGun")
+    if remote then
+        pcall(function() remote:FireServer(CFrame.lookAt(originPos, targetPos), CFrame.new(targetPos)) end)
+        
+        -- Visuals FX
+        createTracer(originPos, targetPos)
+        
+        task.spawn(function()
+            task.wait(0.08)
+            local tc = targetPlayer.Character
+            if not tc then return end
+            local hum = tc:FindFirstChildOfClass("Humanoid")
+            if not hum then return end
+            
+            local isKnocked = false
+            local be = tc:FindFirstChild("BodyEffects")
+            if be and (be:FindFirstChild("K.O") or be:FindFirstChild("KO")) then
+                if (be.K.O or be.KO).Value then isKnocked = true end
+            end
+            
+            local prevHealth = S.SilentAimLastHealth
+            local curHealth = hum.Health
+            S.SilentAimLastHealth = curHealth
+            
+            if isKnocked or (prevHealth ~= nil and curHealth < prevHealth) or hum.Health <= 0 then
+                local dmg = math.random(25, 85)
+                if S.HitChamsEnabled then createHitChams(tc, S.HitChamsColor, S.HitChamsDuration) end
+                if S.HitEffectEnabled then createHitEffect(tc) end
+                if S.DamageIndicatorEnabled then showDamageIndicator(dmg, root.Position + Vector3.new(0,3,0)) end
+                playHitSound()
+            end
+        end)
+    end
+end
+
+local function grabGunAction()
+    local d = workspace:FindFirstChild("GunDrop", true)
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if d and hrp then
+        local old = hrp.CFrame; hrp.CFrame = d.CFrame; task.wait(0.05); hrp.CFrame = old
+    end
+end
+
+-- ============================================================
+-- LOOPS & HOOKS
+-- ============================================================
+local autoPredConn, autoPredBetaConn
+
+local function calculatePrediction(ping)
+    ping = math.clamp(tonumber(ping) or 50, 0, 400)
+    if ping <= 35 then return ping
+    elseif ping <= 50 then return ping + ((ping - 35) / 15) * 18
+    else return ping + (S.AutoPredBetaBuffer or 18) end
+end
+
+local function stopAutoPred()
+    if autoPredConn then autoPredConn:Disconnect(); autoPredConn = nil end
+end
+local function stopAutoPredBeta()
+    if autoPredBetaConn then autoPredBetaConn:Disconnect(); autoPredBetaConn = nil end
+end
+
+Services.UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == S.Keybinds.Shoot then task.spawn(fireSilentAim)
+    elseif input.KeyCode == S.Keybinds.GrabGun then task.spawn(grabGunAction) end
+end)
+
+task.spawn(function()
+    while task.wait(0.1) do
+        if S.AutoGrabGun then
+            local drop = workspace:FindFirstChild("GunDrop", true)
+            local char = LocalPlayer.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            if drop and hrp then
+                pcall(function() firetouchinterest(hrp, drop, 0); firetouchinterest(hrp, drop, 1) end)
+            end
+        end
+    end
+end)
+
+task.spawn(function() while task.wait(1.5) do fetchRoles() end end)
+
+-- ============================================================
+-- PUBLIC API
+-- ============================================================
+function API:EnableSilentAim(v) S.SilentAimEnabled = v end
+function API:IsSilentAimEnabled() return S.SilentAimEnabled end
+function API:SetShootingMethod(v) S.ShootingMethod = v end
+function API:SetWallCheck(v) S.SilentAimWallCheck = v end
+function API:SetAutoGrabGun(v) S.AutoGrabGun = v end
+function API:SetAdaptiveLead(v) S.AdaptiveLead = v end
+function API:SetPingCompensation(v) S.PingCompensation = v end
+function API:SetBulletSpeed(v) S.BulletSpeed = v end
+function API:SetPrediction(v) if not S.AutoPredBeta then S.PredictionPing = v end end
+function API:GetPrediction() return S.PredictionPing end
+function API:IsAutoPredictionOn() return S.AutoPrediction end
+function API:IsAutoPredBetaOn() return S.AutoPredBeta end
+
+function API:EnableAutoPrediction(v)
+    S.AutoPrediction = v
+    if v then
+        S.AutoPredBeta = false; stopAutoPredBeta()
+        autoPredConn = Services.RunService.Heartbeat:Connect(function()
+            S.PredictionPing = getRealPing()
+        end)
+    else stopAutoPred() end
+end
+function API:EnableAutoPredBeta(v)
+    S.AutoPredBeta = v
+    if v then
+        S.AutoPrediction = false; stopAutoPred()
+        autoPredBetaConn = Services.RunService.RenderStepped:Connect(function()
+            local pred = math.floor(calculatePrediction(getRealPing()) + 0.5)
+            S.PredictionPing = pred
+        end)
+    else stopAutoPredBeta() end
+end
+function API:SetAutoPredBetaPrediction(v) if not S.AutoPredBeta then S.PredictionPing = v end end
+function API:SetShootKey(k) if k then S.Keybinds.Shoot = k end end
+function API:SetGrabGunKey(k) if k then S.Keybinds.GrabGun = k end end
+function API:GetShootKey() return S.Keybinds.Shoot.Name end
+function API:GetGrabGunKey() return S.Keybinds.GrabGun.Name end
+
+-- Visuals & Audio Setters
+function API:SetHitChams(v) S.HitChamsEnabled = v end
+function API:SetHitChamsColor(c) S.HitChamsColor = c end
+function API:SetHitChamsDuration(v) S.HitChamsDuration = v end
+
+function API:SetDamageIndicator(v) S.DamageIndicatorEnabled = v end
+function API:SetDamageIndicatorColor(c) S.DamageIndicatorColor = c end
+
+function API:SetBulletTracers(v) S.BulletTracers = v end
+function API:SetTracerColor(c) S.TracerColor = c end
+function API:SetTracerLifetime(v) S.TracerLifetime = v end
+function API:SetTracerWidth(v) S.TracerWidth = v end
+
+function API:SetHitSound(v) S.HitSoundEnabled = v end
+function API:SetHitSoundId(v) S.HitSoundId = v end
+function API:SetHitSoundVolume(v) S.HitSoundVolume = v end
+
+function API:SetHitEffect(v) S.HitEffectEnabled = v end
+function API:SetHitEffectType(v) S.HitEffectType = v end
+function API:SetHitEffectColor(c) S.HitEffectColor = c end
+
+function API:Destroy()
+    stopAutoPred(); stopAutoPredBeta()
+    if chamFolder then chamFolder:Destroy() end
+    if tracerFolder then tracerFolder:Destroy() end
+    if fxGui then fxGui:Destroy() end
+    if hitSound then hitSound:Destroy() end
+end
+
+return API
