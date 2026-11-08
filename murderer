@@ -1,0 +1,266 @@
+-- MM2 Murderer Tools (Knife Silent Aim, Hitbox, Kill All)
+-- Standalone module. Exposes getgenv().MM2Tools for UI integration.
+
+local API = {}
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local LocalPlayer = Players.LocalPlayer
+
+-- Configuration State
+local Config = {
+    HitboxMult = 1,
+    ShowHitbox = false,
+    SilentThrow = false,
+    ThrowKey = Enum.KeyCode.Q,   -- Optional alternative to Right Click
+    KillAllKey = Enum.KeyCode.X
+}
+
+--////////////////////////////////////////////////////////////
+-- CORE FUNCTIONS
+--////////////////////////////////////////////////////////////
+
+-- Finds the player closest to the mouse cursor on screen
+local function getClosestToCursor()
+    local mouse = LocalPlayer:GetMouse()
+    local closest = nil
+    local shortestDist = math.huge
+    
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+            local hum = p.Character:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                local screenPos, onScreen = Workspace.CurrentCamera:WorldToViewportPoint(p.Character.HumanoidRootPart.Position)
+                if onScreen then
+                    local dist = (Vector2.new(mouse.X, mouse.Y) - Vector2.new(screenPos.X, screenPos.Y)).Magnitude
+                    if dist < shortestDist then
+                        shortestDist = dist
+                        closest = p
+                    end
+                end
+            end
+        end
+    end
+    return closest
+end
+
+-- Finds all players within a 3D radius
+local function getPlayersInRadius(radius)
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local list = {}
+    if not root then return list end
+    
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+            local hum = p.Character:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                if (p.Character.HumanoidRootPart.Position - root.Position).Magnitude <= radius then
+                    table.insert(list, p)
+                end
+            end
+        end
+    end
+    return list
+end
+
+-- Fires the knife stab remote for a list of players
+local function stabPlayers(players)
+    local char = LocalPlayer.Character
+    if not char then return end
+    local knife = char:FindFirstChild("Knife")
+    if not knife then return end
+    local events = knife:FindFirstChild("Events")
+    if not events then return end
+    
+    local knifeStabbed = events:FindFirstChild("KnifeStabbed")
+    local handleTouched = events:FindFirstChild("HandleTouched")
+    if not knifeStabbed or not handleTouched then return end
+    
+    pcall(function() knifeStabbed:FireServer() end)
+    
+    for _, plr in ipairs(players) do
+        if plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+            pcall(function() 
+                handleTouched:FireServer(plr.Character.HumanoidRootPart) 
+            end)
+        end
+    end
+end
+
+-- Redirects the knife throw to the target's predicted position
+local function throwKnife(target)
+    local char = LocalPlayer.Character
+    if not char then return end
+    local knife = char:FindFirstChild("Knife")
+    if not knife then return end
+    local rightHand = char:FindFirstChild("RightHand") or char:FindFirstChild("HumanoidRootPart")
+    if not rightHand then return end
+    
+    local remote = knife:FindFirstChild("Throw") or (knife:FindFirstChild("Events") and knife.Events:FindFirstChild("KnifeThrown"))
+    if not remote then return end
+    
+    local targetRoot = target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+    if not targetRoot then return end
+    
+    -- Simple velocity prediction
+    local vel = targetRoot.AssemblyLinearVelocity or Vector3.zero
+    local dist = (targetRoot.Position - rightHand.Position).Magnitude
+    local travel = dist / 600
+    local predPos = targetRoot.Position + (vel * travel)
+    
+    pcall(function()
+        remote:FireServer(CFrame.new(rightHand.Position), CFrame.new(predPos))
+    end)
+end
+
+--////////////////////////////////////////////////////////////
+-- VISUALS
+--////////////////////////////////////////////////////////////
+
+local hitboxPart = Instance.new("Part")
+hitboxPart.Name = "MM2_KnifeHitboxVisual"
+hitboxPart.Shape = Enum.PartType.Ball
+hitboxPart.Anchored = true
+hitboxPart.CanCollide = false
+hitboxPart.CanTouch = false
+hitboxPart.CanQuery = false
+hitboxPart.Material = Enum.Material.Neon
+hitboxPart.Color = Color3.fromRGB(255, 90, 90)
+hitboxPart.Transparency = 0.8
+hitboxPart.Parent = Workspace.CurrentCamera
+hitboxPart.Visible = false
+
+RunService.RenderStepped:Connect(function()
+    if Config.ShowHitbox then
+        local char = LocalPlayer.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if root then
+            local radius = 1.5 * (1 + (Config.HitboxMult - 1) * 0.1)
+            hitboxPart.Size = Vector3.one * radius * 2
+            hitboxPart.CFrame = root.CFrame
+            hitboxPart.Visible = true
+        else
+            hitboxPart.Visible = false
+        end
+    else
+        hitboxPart.Visible = false
+    end
+end)
+
+--////////////////////////////////////////////////////////////
+-- HOOKS & EVENT LISTENERS
+--////////////////////////////////////////////////////////////
+
+local disabledConns = {}
+local function toggleThrowHook(enable)
+    -- Cleanup existing
+    for _, conn in ipairs(disabledConns) do 
+        pcall(function() conn:Enable() end) 
+    end
+    table.clear(disabledConns)
+    
+    -- If enabling and we have getconnections, disable default throw
+    if enable and getconnections then
+        local char = LocalPlayer.Character
+        if char and char:FindFirstChild("Knife") then
+            pcall(function()
+                for _, conn in ipairs(getconnections(char.Knife.Activated)) do
+                    conn:Disable()
+                    table.insert(disabledConns, conn)
+                end
+            end)
+        end
+    end
+end
+
+LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(1)
+    toggleThrowHook(Config.SilentThrow)
+end)
+
+-- Input Handler
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    
+    local char = LocalPlayer.Character
+    if not char or not char:FindFirstChild("Knife") then return end
+    
+    -- Silent Throw (Right Click or configured key)
+    if Config.SilentThrow and (input.UserInputType == Enum.UserInputType.MouseButton2 or input.KeyCode == Config.ThrowKey) then
+        local target = getClosestToCursor()
+        if target then
+            throwKnife(target)
+        end
+    end
+    
+    -- Stab / Hitbox (Left Click)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        local radius = 1.5 * (1 + (Config.HitboxMult - 1) * 0.1)
+        local targets = getPlayersInRadius(radius)
+        if #targets > 0 then
+            stabPlayers(targets)
+        end
+    end
+    
+    -- Kill All
+    if input.KeyCode == Config.KillAllKey then
+        local allPlayers = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character and p.Character:FindFirstChild("Humanoid") then
+                if p.Character.Humanoid.Health > 0 then
+                    table.insert(allPlayers, p)
+                end
+            end
+        end
+        if #allPlayers > 0 then
+            stabPlayers(allPlayers)
+        end
+    end
+end)
+
+--////////////////////////////////////////////////////////////
+-- PUBLIC API
+--////////////////////////////////////////////////////////////
+
+function API:SetHitboxMult(val)
+    Config.HitboxMult = val
+end
+
+function API:ToggleHitbox(val)
+    Config.ShowHitbox = val
+end
+
+function API:ToggleSilentThrow(val)
+    Config.SilentThrow = val
+    toggleThrowHook(val)
+end
+
+function API:KillAll()
+    local char = LocalPlayer.Character
+    if char and char:FindFirstChild("Knife") then
+        local allPlayers = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character and p.Character:FindFirstChild("Humanoid") then
+                if p.Character.Humanoid.Health > 0 then
+                    table.insert(allPlayers, p)
+                end
+            end
+        end
+        if #allPlayers > 0 then
+            stabPlayers(allPlayers)
+        end
+    end
+end
+
+function API:Destroy()
+    if hitboxPart then 
+        hitboxPart:Destroy() 
+    end
+    toggleThrowHook(false)
+end
+
+getgenv().MM2Tools = API
+return API
