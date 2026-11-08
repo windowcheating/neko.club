@@ -1,0 +1,1015 @@
+--// AirFlow Library — Full Example Hub (Updated)
+--// ESP + visuals + world visuals + sheriff modules load from windowcheating/neko.club
+
+local Library = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/kni-fe/free-products/main/AirFlowLibrary.luau"
+))()
+
+getgenv().Library = Library
+
+--////////////////////////////////////////////////////////////////
+--// 1. WINDOW SETUP
+--////////////////////////////////////////////////////////////////
+local Window = Library:Window({
+    Title = "neko.cafe",
+    Version = "beta v1.1",
+    Icon = "code",
+    Size = UDim2.fromOffset(760, 520),
+    Keybind = "RightControl",
+
+    DefaultTheme = "Rose",
+    Backdrop = { Weather = "Sakura", Tint = 0.75 },
+    IslandStyle = "Show on Hover",
+    ToggleButton = false,
+
+    Loading = {
+        Enabled = true,
+        Duration = 5.6,
+        Title = "neko.cafe",
+        Subtitle = "Loading Modules...",
+        Steps = { "Preparing Interface", "Downloading Modules", "Successfully Loading" },
+    },
+    Home = {
+        Name = "Interface",
+        Icon = "activity",
+        Welcome = "Welcome back",
+        Tier = "Private",
+        Discord = "discord.gg/example",
+        Website = "example.com",
+        Stats = { "Players", "Execs", "Session", "FPS", "Ping" },
+        Features = true,
+    },
+    Profile = true,
+    Search = true,
+})
+
+--////////////////////////////////////////////////////////////////
+--// FORCE KEYBIND TO MINIMIZE (SHOW WATERMARK)
+--////////////////////////////////////////////////////////////////
+task.spawn(function()
+    task.wait(1)
+    Window.Keybind = nil
+
+    game:GetService("UserInputService").InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed then return end
+        if input.KeyCode == Enum.KeyCode.RightControl then
+            task.defer(function()
+                if Window.Minimized then
+                    Window:Restore()
+                elseif Window.Open then
+                    Window:Minimize()
+                end
+            end)
+        end
+    end)
+end)
+
+--////////////////////////////////////////////////////////////////
+--// ACCENT HELPER
+--////////////////////////////////////////////////////////////////
+local function getAccent()
+    local theme = Library and Library.Theme
+    if not theme or not theme.Accent then return Color3.fromHex("#9791df") end
+    if typeof(theme.Accent) == "ColorSequence" then
+        return theme.Accent.Keypoints[1].Value
+    elseif typeof(theme.Accent) == "Color3" then
+        return theme.Accent
+    end
+    return Color3.fromHex("#9791df")
+end
+
+local ACCENT = getAccent()
+
+local colorTouched = {
+    selfMat = false, toolMat = false, partAura = false,
+    toolAura = false, cursorPet = false, charizard = false, crosshair = false,
+}
+
+--////////////////////////////////////////////////////////////////
+--// DECORATOR ENGINE
+--////////////////////////////////////////////////////////////////
+local decorator = nil
+local decoratorVisible = true
+
+local cachedAssets = {}
+local decorOptions = {
+    ["waifu"] = { url = "https://files.catbox.moe/z7zvgv.png", size = UDim2.fromOffset(180, 120), position = UDim2.new(1, -10, 0, 18) },
+    ["mei mei"] = { url = "https://files.catbox.moe/sysmjw.png", size = UDim2.fromOffset(130, 130), position = UDim2.new(1, -25, 0, -2) }
+}
+
+local function downloadAsset(name)
+    local opt = decorOptions[name]; if not opt then return end
+    if type(writefile) == "function" and type(isfile) == "function" and type(getcustomasset) == "function" then
+        local folder = "AirFlowDecorator"
+        if type(isfolder) == "function" and type(makefolder) == "function" and not isfolder(folder) then makefolder(folder) end
+        local fileName = (name == "waifu" and "customgirl2.png" or "meimei.png")
+        local path = folder .. "/" .. fileName
+        if not isfile(path) then
+            local ok, body = pcall(function() return game:HttpGet(opt.url) end)
+            if ok and body then writefile(path, body) end
+        end
+        if isfile(path) then cachedAssets[name] = getcustomasset(path) end
+    else
+        cachedAssets[name] = opt.url
+    end
+end
+
+task.spawn(function() downloadAsset("waifu"); downloadAsset("mei mei") end)
+
+local function setDecorator(name)
+    local opt = decorOptions[name]; if not opt or not decorator then return end
+    decorator.Size = opt.size
+    decorator.Position = opt.position
+    decorator.Image = cachedAssets[name] or opt.url
+end
+
+task.spawn(function()
+    task.wait(1.5)
+    decorator = Instance.new("ImageLabel")
+    decorator.Name = "TopLogoDecorator"
+    decorator.BackgroundTransparency = 1
+    decorator.ZIndex = 50
+    decorator.AnchorPoint = Vector2.new(1, 1)
+    decorator.ImageTransparency = 1
+    decorator.Visible = true
+    Window.Body.ClipsDescendants = false
+    decorator.Parent = Window.Body
+    setDecorator("waifu")
+
+    task.spawn(function()
+        local RunService = game:GetService("RunService")
+        local lastAlpha = -1
+        RunService.RenderStepped:Connect(function()
+            if not decorator or not Window.Body then return end
+            local currentAlpha = Window._bodyAlpha or 0
+            local isHidden = not Window.Open or Window.Minimized
+            if currentAlpha ~= lastAlpha or isHidden ~= (decorator.ImageTransparency == 1) then
+                lastAlpha = currentAlpha
+                decorator.ImageTransparency = (decoratorVisible and not isHidden) and currentAlpha or 1
+            end
+        end)
+    end)
+end)
+
+--////////////////////////////////////////////////////////////////
+--// KEYBIND HUD
+--////////////////////////////////////////////////////////////////
+local kbGui = Instance.new("ScreenGui")
+kbGui.Name = "AirFlow_KeybindHUD"
+kbGui.ResetOnSpawn = false
+kbGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+kbGui.Enabled = false
+kbGui.Parent = game:GetService("CoreGui")
+
+local mainCard = Instance.new("Frame")
+mainCard.Name = "KeybindsCard"
+mainCard.Size = UDim2.new(0, 180, 0, 28)
+mainCard.Position = UDim2.new(0.04, 0, 0.45, 0)
+mainCard.BackgroundColor3 = Color3.fromRGB(22, 15, 18)
+mainCard.BackgroundTransparency = 0.05
+mainCard.BorderSizePixel = 0
+mainCard.ClipsDescendants = true
+mainCard.Parent = kbGui
+
+local c1 = Instance.new("UICorner", mainCard); c1.CornerRadius = UDim.new(0, 7)
+local s1 = Instance.new("UIStroke", mainCard)
+s1.Color = Color3.fromRGB(22, 15, 18); s1.Thickness = 1; s1.Transparency = 1
+
+local headerBar = Instance.new("Frame", mainCard)
+headerBar.Size = UDim2.new(1, 0, 0, 27); headerBar.BackgroundTransparency = 1
+
+local title = Instance.new("TextLabel", headerBar)
+title.Size = UDim2.new(1, -20, 1, 0); title.Position = UDim2.new(0, 10, 0, 0)
+title.BackgroundTransparency = 1; title.Text = "keybinds"
+title.TextColor3 = Color3.fromRGB(240, 228, 232); title.TextSize = 11
+title.Font = Enum.Font.GothamBold; title.TextXAlignment = Enum.TextXAlignment.Left
+
+local sep = Instance.new("Frame", mainCard)
+sep.Size = UDim2.new(1, -16, 0, 1); sep.Position = UDim2.new(0, 8, 0, 27)
+sep.BackgroundColor3 = Color3.fromRGB(246, 160, 186); sep.BackgroundTransparency = 0.85
+sep.BorderSizePixel = 0
+
+local rowsHolder = Instance.new("Frame", mainCard)
+rowsHolder.Name = "RowsHolder"
+rowsHolder.Size = UDim2.new(1, 0, 1, -29); rowsHolder.Position = UDim2.new(0, 0, 0, 29)
+rowsHolder.BackgroundTransparency = 1
+
+local pad = Instance.new("UIPadding", rowsHolder)
+pad.PaddingLeft = UDim.new(0, 10); pad.PaddingRight = UDim.new(0, 10)
+pad.PaddingTop = UDim.new(0, 5);   pad.PaddingBottom = UDim.new(0, 5)
+
+local layout = Instance.new("UIListLayout", rowsHolder)
+layout.Padding = UDim.new(0, 3); layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local dragging, dragStart, startPos, dragInput
+headerBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true; dragStart = input.Position; startPos = mainCard.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end)
+headerBar.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+game:GetService("UserInputService").InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        local delta = input.Position - dragStart
+        mainCard.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+
+local TrackedKeybinds = {}
+
+--////////////////////////////////////////////////////////////////
+--// 2. TABS
+--////////////////////////////////////////////////////////////////
+local MainTab        = Window:Tab({ Name = "Main",          Icon = "house",    Desc = "Core features" })
+local VisualTab      = Window:Tab({ Name = "Visuals",       Icon = "eye" })
+local WorldVisualTab = Window:Tab({ Name = "World Visuals", Icon = "sun" })
+local SheriffTab     = Window:Tab({ Name = "Sheriff",       Icon = "crosshair" })
+local PlayerTab      = Window:Tab({ Name = "Player",        Icon = "user" })
+local SettingsTab    = Window:Tab({ Name = "Settings",      Icon = "settings" })
+
+--////////////////////////////////////////////////////////////////
+--// 3. SUB TABS
+--////////////////////////////////////////////////////////////////
+local CombatSub   = MainTab:SubTab({ Name = "Combat",   Icon = "sword" })
+local ResourceSub = MainTab:SubTab({ Name = "Resource", Icon = "gem" })
+local MiscSub     = MainTab:SubTab({ Name = "Misc",     Icon = "wrench" })
+
+--////////////////////////////////////////////////////////////////
+--// 4. GROUPBOXES
+--////////////////////////////////////////////////////////////////
+local PlayerGroup = PlayerTab:Groupbox({ Name = "Player Stats", Icon = "user", Side = "Left" })
+local UtilGroup   = PlayerTab:Groupbox({ Name = "Utilities",   Icon = "wrench", Side = "Right" })
+
+--////////////////////////////////////////////////////////////////
+--// 5. MAIN / COMBAT
+--////////////////////////////////////////////////////////////////
+CombatSub:Section("Aim")
+
+local AimbotEnabled = false
+local AimbotKey = Enum.KeyCode.F
+table.insert(TrackedKeybinds, {
+    Name = "Aimbot",
+    GetKey = function() return AimbotKey.Name end,
+    IsActive = function() return AimbotEnabled end
+})
+
+CombatSub:Toggle({
+    Name = "Aimbot", Flag = "Aimbot", Default = false,
+    Callback = function(value) AimbotEnabled = value end,
+})
+
+CombatSub:Dropdown({
+    Name = "Aim Part", Flag = "AimPart",
+    Options = { "Head", "Torso", "Random" }, Default = "Head",
+    AllowNone = false,
+    Callback = function(v) print("[AimPart]", v) end,
+})
+
+CombatSub:Divider()
+
+--////////////////////////////////////////////////////////////////
+--// 6. MAIN / RESOURCE
+--////////////////////////////////////////////////////////////////
+ResourceSub:Section("Farming")
+
+local AutoFarmEnabled = false
+table.insert(TrackedKeybinds, {
+    Name = "Auto Farm",
+    GetKey = function() return "Toggle" end,
+    IsActive = function() return AutoFarmEnabled end
+})
+
+ResourceSub:Toggle({ Name = "Auto Farm", Flag = "AutoFarm", Default = false, Callback = function(v) AutoFarmEnabled = v end })
+ResourceSub:Slider({ Name = "Farm Speed", Flag = "FarmSpeed", Min = 1, Max = 10, Step = 1, Default = 3, Suffix = "x",
+    Callback = function(v) print("[FarmSpeed]", v) end, OnRelease = function(v) print("[FarmSpeed released]", v) end })
+ResourceSub:Dropdown({ Name = "Farm Mode", Flag = "FarmMode", Options = { "Legit", "Blatant", "Silent" }, Default = "Legit", AllowNone = false,
+    Callback = function(v) print("[FarmMode]", v) end })
+ResourceSub:Input({ Name = "Farm Amount", Flag = "FarmAmount", Numeric = true, Placeholder = "1000", Callback = function(n) print("[FarmAmount]", n) end })
+ResourceSub:Input({ Name = "Kill Message", Flag = "KillMsg", Placeholder = "Type a message...", Default = "gg", Callback = function(t) print("[KillMsg]", t) end })
+
+--////////////////////////////////////////////////////////////////
+--// 7. MAIN / MISC
+--////////////////////////////////////////////////////////////////
+MiscSub:Section("Actions")
+
+MiscSub:Button({ Name = "Rejoin Server", Desc = "Teleport back to this server", Icon = "refresh-cw", Style = "Primary", Callback = function() Window:Rejoin() end })
+MiscSub:Button({ Name = "Server Hop", Desc = "Jump to a random server", Icon = "shuffle", Callback = function() Window:ServerHop() end })
+MiscSub:ButtonRow({
+    { Name = "Lowest Server", Callback = function() Window:JoinLowestServer() end },
+    { Name = "Copy Job ID",   Callback = function() Window:CopyToClipboard(game.JobId, "Job ID") end },
+})
+
+local PanicKey = Enum.KeyCode.F
+table.insert(TrackedKeybinds, {
+    Name = "Panic Key",
+    GetKey = function() return PanicKey.Name end,
+    IsActive = function() return Window.Open end
+})
+
+MiscSub:Keybind({ Name = "Panic Key", Flag = "PanicKey", Default = "F", Callback = function(key) print("[Panic]", key.Name) end,
+    OnChanged = function(key) if key then PanicKey = key end end })
+MiscSub:Stepper({ Name = "Teleport Distance", Icon = "chevrons-up-down", Min = 1, Max = 100, Step = 1, Default = 10, Suffix = "m",
+    Callback = function(v) print("[Stepper]", v) end })
+
+local Progress = MiscSub:Progress({ Name = "Loading", Default = 0, Callback = function(v) end })
+Progress:Set(0.35)
+
+--////////////////////////////////////////////////////////////////
+--// 8. PLAYER GROUPBOXES
+--////////////////////////////////////////////////////////////////
+PlayerGroup:Toggle({ Name = "God Mode", Flag = "GodMode", Callback = function(v) print("[GodMode]", v) end })
+PlayerGroup:Slider({ Name = "Walk Speed", Flag = "WalkSpeed", Min = 16, Max = 300, Step = 1, Default = 16, Suffix = " studs",
+    Callback = function(v)
+        local char = game.Players.LocalPlayer.Character
+        if char and char:FindFirstChildOfClass("Humanoid") then char:FindFirstChildOfClass("Humanoid").WalkSpeed = v end
+    end })
+PlayerGroup:Slider({ Name = "Jump Power", Flag = "JumpPower", Min = 50, Max = 500, Step = 1, Default = 50,
+    Callback = function(v)
+        local char = game.Players.LocalPlayer.Character
+        if char and char:FindFirstChildOfClass("Humanoid") then char:FindFirstChildOfClass("Humanoid").JumpPower = v end
+    end })
+
+UtilGroup:Dropdown({ Name = "Whitelist", Flag = "Whitelist", Options = { "Player1", "Player2", "Player3" }, Multi = true, Default = { "Player1" },
+    Callback = function(values) print("[Whitelist]", table.concat(values, ", ")) end })
+UtilGroup:Button({ Name = "Refresh Whitelist", Callback = function()
+    local names = {}
+    for _, p in ipairs(game.Players:GetPlayers()) do
+        if p ~= game.Players.LocalPlayer then table.insert(names, p.Name) end
+    end
+    UtilGroup:Dropdown({ Name = "Whitelist", Flag = "Whitelist", Options = names, Multi = true })
+end })
+
+--////////////////////////////////////////////////////////////////
+--// 9. LABELS & STATUS
+--////////////////////////////////////////////////////////////////
+MainTab:Label({ Text = "Welcome to the script!" })
+MainTab:Label({ Text = "FPS: --", Update = function() return "FPS: " .. math.floor(workspace:GetRealPhysicsFPS()) end, UpdateRate = 1 })
+
+local StatusBadge = MainTab:Status({ Name = "Status", Value = "Idle", Style = "Badge", Tone = "Success" })
+StatusBadge:Set("Running")
+MainTab:Status({ Name = "Players", Style = "Plain", Update = function() return #game.Players:GetPlayers() .. "/" .. game.Players.MaxPlayers end, UpdateRate = 2 })
+local EventLog = MainTab:StatusList({ Name = "Recent Events", MaxRows = 6 })
+EventLog:Set({ { Text = "Player joined", Value = "Alice", Tone = "Success" }, { Text = "Player left", Value = "Bob", Tone = "Error" } })
+
+--////////////////////////////////////////////////////////////////
+--// 10. TABLE
+--////////////////////////////////////////////////////////////////
+local Leaderboard = MainTab:Table({
+    Name = "Leaderboard",
+    Columns = {
+        { Name = "Player", Width = 0.5 },
+        { Name = "Kills",  Width = 0.25, Sortable = true },
+        { Name = "Deaths", Width = 0.25, Sortable = true },
+    },
+    Rows = { { "Alice", 42, 3 }, { "Bob", 17, 12 } },
+    Search = true, MaxRows = 8,
+})
+Leaderboard:AddRow({ "Charlie", 5, 5 })
+Leaderboard:Sort("Kills", true)
+
+--////////////////////////////////////////////////////////////////
+--// 11. VISUALS TAB
+--////////////////////////////////////////////////////////////////
+local ESPVisualGroup   = VisualTab:Groupbox({ Name = "ESP Settings",    Icon = "eye",       Side = "Left" })
+local SelfMatGroup     = VisualTab:Groupbox({ Name = "Self Material",  Icon = "user",      Side = "Left" })
+local PartAuraGroup    = VisualTab:Groupbox({ Name = "Particle Aura",  Icon = "sparkles",  Side = "Left" })
+local CursorPetGroup   = VisualTab:Groupbox({ Name = "Cursor Pet",     Icon = "cat",       Side = "Left" })
+
+local PreviewGroup     = VisualTab:Groupbox({ Name = "Preview",        Icon = "box",       Side = "Right" })
+local ToolMatGroup     = VisualTab:Groupbox({ Name = "Tool Material",  Icon = "hammer",    Side = "Right" })
+local ToolAuraGroup    = VisualTab:Groupbox({ Name = "Tool Aura",      Icon = "wand",      Side = "Right" })
+local CharizardGroup   = VisualTab:Groupbox({ Name = "Charizard Cursor", Icon = "flame",   Side = "Right" })
+local CrosshairGroup   = VisualTab:Groupbox({ Name = "Crosshair",      Icon = "target",    Side = "Right" })
+
+-- ESP module
+local ESP_URL = "https://raw.githubusercontent.com/windowcheating/neko.club/refs/heads/main/espppp"
+local ESP = (function()
+    local ok, src = pcall(game.HttpGet, game, ESP_URL)
+    if not ok or not src or #src < 20 then warn("[ESP] Failed: "..tostring(ok and "empty" or src)); return nil end
+    local fn, err = loadstring(src)
+    if not fn then warn("[ESP] Compile: "..tostring(err)); return nil end
+    local ok2, result = pcall(fn)
+    if not ok2 then warn("[ESP] Runtime: "..tostring(result)); return nil end
+    if type(result) ~= "table" then warn("[ESP] Not a table: "..type(result)); return nil end
+    print("[ESP] Loaded from "..ESP_URL)
+    return result
+end)()
+
+-- Visuals module
+local VISUALS_URL = "https://raw.githubusercontent.com/windowcheating/neko.club/refs/heads/main/visualsssssss"
+local VisualsAPI = (function()
+    local ok, src = pcall(game.HttpGet, game, VISUALS_URL)
+    if not ok or not src or #src < 20 then warn("[Visuals] Failed: "..tostring(ok and "empty" or src)); return nil end
+    local fn, err = loadstring(src)
+    if not fn then warn("[Visuals] Compile: "..tostring(err)); return nil end
+    local ok2, result = pcall(fn)
+    if not ok2 then warn("[Visuals] Runtime: "..tostring(result)); return nil end
+    if type(result) ~= "table" then warn("[Visuals] Not a table: "..type(result)); return nil end
+    print("[Visuals] Loaded from "..VISUALS_URL)
+    return result
+end)()
+
+-- World Visuals module
+local WORLD_VIS_URL = "https://raw.githubusercontent.com/windowcheating/neko.club/refs/heads/main/zzzzzzzworld"
+local WorldAPI = (function()
+    local ok, src = pcall(game.HttpGet, game, WORLD_VIS_URL)
+    if not ok or not src or #src < 20 then warn("[WorldVis] Failed: "..tostring(ok and "empty" or src)); return nil end
+    local fn, err = loadstring(src)
+    if not fn then warn("[WorldVis] Compile: "..tostring(err)); return nil end
+    local ok2, result = pcall(fn)
+    if not ok2 then warn("[WorldVis] Runtime: "..tostring(result)); return nil end
+    if type(result) ~= "table" then warn("[WorldVis] Not a table: "..type(result)); return nil end
+    print("[WorldVis] Loaded from "..WORLD_VIS_URL)
+    return result
+end)()
+
+-- Sheriff module
+local SHERIFF_URL = "https://raw.githubusercontent.com/windowcheating/neko.club/refs/heads/main/neko.clubbb%20sheriff"
+local SheriffAPI = (function()
+    local ok, src = pcall(game.HttpGet, game, SHERIFF_URL)
+    if not ok or not src or #src < 20 then warn("[Sheriff] Failed: "..tostring(ok and "empty" or src)); return nil end
+    local fn, err = loadstring(src)
+    if not fn then warn("[Sheriff] Compile: "..tostring(err)); return nil end
+    local ok2, result = pcall(fn)
+    if not ok2 then warn("[Sheriff] Runtime: "..tostring(result)); return nil end
+    if type(result) ~= "table" then warn("[Sheriff] Not a table: "..type(result)); return nil end
+    print("[Sheriff] Loaded from "..SHERIFF_URL)
+    return result
+end)()
+
+local function safeCall(mod, method, label)
+    if not mod then warn("["..label.."] module not loaded"); return end
+    local ok, err = pcall(function() mod[method](mod) end)
+    if not ok then warn("["..label.."] "..method..": "..tostring(err)) end
+end
+local function safeSet(mod, method, val, label)
+    if not mod then return end
+    pcall(function() mod[method](mod, val) end)
+end
+
+-- ESP toggles
+ESPVisualGroup:Toggle({ Name = "Highlight",        Default = false, Callback = function(v) safeCall(ESP, v and "EnableHighlight" or "DisableHighlight", "Highlight") end })
+ESPVisualGroup:Toggle({ Name = "Dropped Gun ESP",  Default = false, Callback = function(v) safeCall(ESP, v and "EnableGunESP"    or "DisableGunESP",    "GunESP")    end })
+ESPVisualGroup:Toggle({ Name = "Trap ESP",         Default = false, Callback = function(v) safeCall(ESP, v and "EnableTrapESP"   or "DisableTrapESP",   "TrapESP")   end })
+ESPVisualGroup:Toggle({ Name = "Footstep Trails",  Default = false, Callback = function(v) safeCall(ESP, v and "EnableFootsteps" or "DisableFootsteps", "Footsteps") end })
+
+-- Preview
+local Preview = PreviewGroup:Viewport({ Name = "Character Preview", Model = game.Players.LocalPlayer, Height = 260, Spin = true })
+local vpf = Preview.Media or Preview._frame or Preview.Frame
+if vpf and not vpf:IsA("ViewportFrame") then vpf = vpf:FindFirstChildWhichIsA("ViewportFrame") or vpf end
+local previewOverlay = Instance.new("Frame")
+previewOverlay.Size = UDim2.new(1,0,1,0)
+previewOverlay.BackgroundTransparency = 1
+previewOverlay.ZIndex = 10
+previewOverlay.Parent = vpf
+
+-- Self Material
+SelfMatGroup:Toggle({ Name = "Enabled", Default = false,
+    Callback = function(v) safeCall(VisualsAPI, v and "EnableSelfMaterial" or "DisableSelfMaterial", "SelfMat") end })
+SelfMatGroup:Dropdown({ Name = "Material", Options = { "ForceField", "Neon", "Glass", "Wireframe", "SmoothPlastic" }, Default = "Neon", AllowNone = false,
+    Callback = function(v) safeSet(VisualsAPI, "SetSelfMaterialMaterial", v, "SelfMat") end })
+SelfMatGroup:ColorPicker({ Name = "Color", Default = ACCENT,
+    Callback = function(c) colorTouched.selfMat = true; safeSet(VisualsAPI, "SetSelfMaterialColor", c, "SelfMat") end })
+SelfMatGroup:Slider({ Name = "Transparency", Min = 0, Max = 0.95, Step = 0.05, Default = 0,
+    Callback = function(v) safeSet(VisualsAPI, "SetSelfMaterialTransparency", v, "SelfMat") end })
+
+-- Tool Material
+ToolMatGroup:Toggle({ Name = "Enabled", Default = false,
+    Callback = function(v) safeCall(VisualsAPI, v and "EnableToolMaterial" or "DisableToolMaterial", "ToolMat") end })
+ToolMatGroup:Dropdown({ Name = "Material", Options = { "Neon", "ForceField" }, Default = "Neon", AllowNone = false,
+    Callback = function(v) safeSet(VisualsAPI, "SetToolMaterialMaterial", v, "ToolMat") end })
+ToolMatGroup:ColorPicker({ Name = "Color", Default = ACCENT,
+    Callback = function(c) colorTouched.toolMat = true; safeSet(VisualsAPI, "SetToolMaterialColor", c, "ToolMat") end })
+ToolMatGroup:Slider({ Name = "Transparency", Min = 0, Max = 0.95, Step = 0.05, Default = 0,
+    Callback = function(v) safeSet(VisualsAPI, "SetToolMaterialTransparency", v, "ToolMat") end })
+
+-- Particle Aura
+PartAuraGroup:Toggle({ Name = "Enabled", Default = false,
+    Callback = function(v) safeCall(VisualsAPI, v and "EnableParticleAura" or "DisableParticleAura", "PartAura") end })
+PartAuraGroup:Dropdown({ Name = "Aura", Options = { "starlight","heavenly","ribbon","sakura","angel","wind","flow","star" }, Default = "angel", AllowNone = false,
+    Callback = function(v) safeSet(VisualsAPI, "SetParticleAuraType", v, "PartAura") end })
+PartAuraGroup:ColorPicker({ Name = "Color", Default = ACCENT,
+    Callback = function(c) colorTouched.partAura = true; safeSet(VisualsAPI, "SetParticleAuraColor", c, "PartAura") end })
+
+-- Tool Aura
+ToolAuraGroup:Toggle({ Name = "Enabled", Default = false,
+    Callback = function(v) safeCall(VisualsAPI, v and "EnableToolAura" or "DisableToolAura", "ToolAura") end })
+ToolAuraGroup:ColorPicker({ Name = "Color", Default = ACCENT,
+    Callback = function(c) colorTouched.toolAura = true; safeSet(VisualsAPI, "SetToolAuraColor", c, "ToolAura") end })
+ToolAuraGroup:Slider({ Name = "Rate Multiplier", Min = 0.1, Max = 5, Step = 0.1, Default = 0.1,
+    Callback = function(v) safeSet(VisualsAPI, "SetToolAuraRate", v, "ToolAura") end })
+
+-- Cursor Pet
+CursorPetGroup:Toggle({ Name = "Enabled", Default = false,
+    Callback = function(v) safeCall(VisualsAPI, v and "EnableCursorPet" or "DisableCursorPet", "CursorPet") end })
+CursorPetGroup:ColorPicker({ Name = "Color", Default = ACCENT,
+    Callback = function(c) colorTouched.cursorPet = true; safeSet(VisualsAPI, "SetCursorPetColor", c, "CursorPet") end })
+CursorPetGroup:Toggle({ Name = "Follow Target", Default = true,
+    Callback = function(v) safeSet(VisualsAPI, "SetCursorPetFollowTarget", v, "CursorPet") end })
+CursorPetGroup:Slider({ Name = "Speed", Min = 50, Max = 350, Step = 1, Default = 110,
+    Callback = function(v) safeSet(VisualsAPI, "SetCursorPetSpeed", v, "CursorPet") end })
+CursorPetGroup:Slider({ Name = "Follow Distance", Min = 10, Max = 150, Step = 1, Default = 45,
+    Callback = function(v) safeSet(VisualsAPI, "SetCursorPetDistance", v, "CursorPet") end })
+
+-- Charizard Cursor
+CharizardGroup:Toggle({ Name = "Enabled", Default = false,
+    Callback = function(v) safeCall(VisualsAPI, v and "EnableCharizardCursor" or "DisableCharizardCursor", "Charizard") end })
+CharizardGroup:ColorPicker({ Name = "Color", Default = Color3.fromHex("#706669"),
+    Callback = function(c) colorTouched.charizard = true; safeSet(VisualsAPI, "SetCharizardColor", c, "Charizard") end })
+CharizardGroup:Dropdown({ Name = "Position", Options = { "Mouse", "Above Tool", "Follow Target", "Shoulder" }, Default = "Shoulder", AllowNone = false,
+    Callback = function(v) safeSet(VisualsAPI, "SetCharizardMode", v, "Charizard") end })
+
+-- Crosshair
+CrosshairGroup:Toggle({ Name = "Enabled", Default = false,
+    Callback = function(v) safeCall(VisualsAPI, v and "EnableCrosshair" or "DisableCrosshair", "Crosshair") end })
+CrosshairGroup:Dropdown({ Name = "Position", Options = { "mouse", "gun tip", "target" }, Default = "mouse", AllowNone = false,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairPosition", v, "Crosshair") end })
+CrosshairGroup:ColorPicker({ Name = "Color", Default = ACCENT,
+    Callback = function(c)
+        colorTouched.crosshair = true
+        safeSet(VisualsAPI, "SetCrosshairColor", c, "Crosshair")
+        if VisualsAPI then
+            pcall(function() VisualsAPI:SetCrosshairTextColor(Color3.fromRGB(255,255,255)) end)
+            pcall(function() VisualsAPI:SetCrosshairAccentColor(c) end)
+        end
+    end })
+CrosshairGroup:Slider({ Name = "Lines", Min = 2, Max = 8, Step = 1, Default = 4,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairLines", v, "Crosshair") end })
+CrosshairGroup:Slider({ Name = "Radius", Min = 2, Max = 50, Step = 1, Default = 14,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairRadius", v, "Crosshair") end })
+CrosshairGroup:Slider({ Name = "Length", Min = 2, Max = 40, Step = 1, Default = 9,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairLength", v, "Crosshair") end })
+CrosshairGroup:Slider({ Name = "Thickness", Min = 1, Max = 5, Step = 1, Default = 2,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairThickness", v, "Crosshair") end })
+CrosshairGroup:Slider({ Name = "Rotation", Min = 0, Max = 360, Step = 1, Default = 0,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairRotation", v, "Crosshair") end })
+CrosshairGroup:Toggle({ Name = "Spin", Default = true,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairSpin", v, "Crosshair") end })
+CrosshairGroup:Slider({ Name = "Spin Speed", Min = 10, Max = 720, Step = 10, Default = 120,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairSpinSpeed", v, "Crosshair") end })
+CrosshairGroup:Toggle({ Name = "Pulse", Default = true,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairPulse", v, "Crosshair") end })
+CrosshairGroup:Slider({ Name = "Gap Pulse", Min = 0, Max = 25, Step = 1, Default = 5,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairGapPulse", v, "Crosshair") end })
+CrosshairGroup:Slider({ Name = "Size Pulse", Min = 0, Max = 25, Step = 1, Default = 6,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairSizePulse", v, "Crosshair") end })
+CrosshairGroup:Toggle({ Name = "Hide Game Crosshair", Default = false,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairHideGame", v, "Crosshair") end })
+
+-- Startup seed for visuals
+task.spawn(function()
+    task.wait(1.5)
+    if not VisualsAPI then return end
+    pcall(function() VisualsAPI:SetSelfMaterialColor(ACCENT) end)
+    pcall(function() VisualsAPI:SetToolMaterialColor(ACCENT) end)
+    pcall(function() VisualsAPI:SetParticleAuraColor(ACCENT) end)
+    pcall(function() VisualsAPI:SetToolAuraColor(ACCENT) end)
+    pcall(function() VisualsAPI:SetCursorPetColor(ACCENT) end)
+    pcall(function() VisualsAPI:SetCharizardColor(Color3.fromHex("#706669")) end)
+    pcall(function() VisualsAPI:SetCharizardMode("Shoulder") end)
+    pcall(function() VisualsAPI:SetCrosshairColor(ACCENT) end)
+    pcall(function() VisualsAPI:SetCrosshairTextColor(Color3.fromRGB(255,255,255)) end)
+    pcall(function() VisualsAPI:SetCrosshairAccentColor(ACCENT) end)
+end)
+
+-- Theme sync for visuals
+table.insert(Library._themeListeners, function()
+    if not VisualsAPI then return end
+    local a = getAccent()
+    if not colorTouched.selfMat   then pcall(function() VisualsAPI:SetSelfMaterialColor(a) end) end
+    if not colorTouched.toolMat   then pcall(function() VisualsAPI:SetToolMaterialColor(a) end) end
+    if not colorTouched.partAura  then pcall(function() VisualsAPI:SetParticleAuraColor(a) end) end
+    if not colorTouched.toolAura  then pcall(function() VisualsAPI:SetToolAuraColor(a) end) end
+    if not colorTouched.cursorPet then pcall(function() VisualsAPI:SetCursorPetColor(a) end) end
+    if not colorTouched.charizard then pcall(function() VisualsAPI:SetCharizardColor(Color3.fromHex("#706669")) end) end
+    if not colorTouched.crosshair then pcall(function() VisualsAPI:SetCrosshairColor(a) end) end
+    pcall(function() VisualsAPI:SetCrosshairAccentColor(a) end)
+end)
+
+--////////////////////////////////////////////////////////////////
+--// 12. WORLD VISUALS TAB
+--////////////////////////////////////////////////////////////////
+local LightingGroup  = WorldVisualTab:Groupbox({ Name = "Lighting & Time",   Icon = "sun",        Side = "Left" })
+local AtmosGroup     = WorldVisualTab:Groupbox({ Name = "Atmosphere",        Icon = "cloud",      Side = "Left" })
+local ScreenGroup    = WorldVisualTab:Groupbox({ Name = "Screen Adjustments", Icon = "monitor",    Side = "Left" })
+local WeatherGroup   = WorldVisualTab:Groupbox({ Name = "Weather & Skybox",  Icon = "cloud-rain", Side = "Right" })
+local TexturesGroup  = WorldVisualTab:Groupbox({ Name = "World Textures",    Icon = "image",      Side = "Right" })
+local RTXGroup       = WorldVisualTab:Groupbox({ Name = "RTX",               Icon = "sparkles",   Side = "Right" })
+
+LightingGroup:Toggle({ Name = "Lighting Mode", Default = false,
+    Callback = function(v) safeSet(WorldAPI, "EnableLightingMode", v, "WorldVis") end })
+LightingGroup:Dropdown({ Name = "Mode", Options = { "compatibility","shadowmap","future","voxel" }, Default = "shadowmap", AllowNone = false,
+    Callback = function(v) safeSet(WorldAPI, "SetLightingType", v, "WorldVis") end })
+LightingGroup:Toggle({ Name = "World Time", Default = false,
+    Callback = function(v) safeSet(WorldAPI, "EnableWorldTime", v, "WorldVis") end })
+LightingGroup:Slider({ Name = "Hour", Min = 0, Max = 24, Step = 1, Default = 4,
+    Callback = function(v) safeSet(WorldAPI, "SetWorldTimeHour", v, "WorldVis") end })
+LightingGroup:Toggle({ Name = "Ambient", Default = false,
+    Callback = function(v) safeSet(WorldAPI, "EnableAmbient", v, "WorldVis") end })
+LightingGroup:ColorPicker({ Name = "Ambient Color", Default = ACCENT,
+    Callback = function(c) safeSet(WorldAPI, "SetAmbientColor", c, "WorldVis") end })
+LightingGroup:ColorPicker({ Name = "Outdoor Color", Default = ACCENT,
+    Callback = function(c) safeSet(WorldAPI, "SetOutdoorColor", c, "WorldVis") end })
+
+AtmosGroup:Toggle({ Name = "Atmosphere", Default = false,
+    Callback = function(v) safeSet(WorldAPI, "EnableAtmosphere", v, "WorldVis") end })
+AtmosGroup:ColorPicker({ Name = "Color", Default = ACCENT,
+    Callback = function(c) safeSet(WorldAPI, "SetAtmosphereColor", c, "WorldVis") end })
+AtmosGroup:ColorPicker({ Name = "Decay", Default = ACCENT,
+    Callback = function(c) safeSet(WorldAPI, "SetAtmosphereDecay", c, "WorldVis") end })
+AtmosGroup:Slider({ Name = "Haze",    Min = 0, Max = 10, Step = 1, Default = 1,
+    Callback = function(v) safeSet(WorldAPI, "SetAtmosphereHaze", v, "WorldVis") end })
+AtmosGroup:Slider({ Name = "Glare",   Min = 0, Max = 10, Step = 1, Default = 10,
+    Callback = function(v) safeSet(WorldAPI, "SetAtmosphereGlare", v, "WorldVis") end })
+AtmosGroup:Slider({ Name = "Offset",  Min = 0, Max = 1, Step = 0.05, Default = 0,
+    Callback = function(v) safeSet(WorldAPI, "SetAtmosphereOffset", v, "WorldVis") end })
+AtmosGroup:Slider({ Name = "Density", Min = 0, Max = 1, Step = 0.05, Default = 0.35,
+    Callback = function(v) safeSet(WorldAPI, "SetAtmosphereDensity", v, "WorldVis") end })
+
+ScreenGroup:Slider({ Name = "Contrast", Min = -1, Max = 1, Step = 0.05, Default = 0,
+    Callback = function(v) safeSet(WorldAPI, "SetContrast", v, "WorldVis") end })
+ScreenGroup:Slider({ Name = "Saturation", Min = -1, Max = 1, Step = 0.05, Default = 0,
+    Callback = function(v) safeSet(WorldAPI, "SetSaturation", v, "WorldVis") end })
+ScreenGroup:Slider({ Name = "Brightness", Min = -1, Max = 1, Step = 0.05, Default = 0,
+    Callback = function(v) safeSet(WorldAPI, "SetBrightness", v, "WorldVis") end })
+
+WeatherGroup:Dropdown({ Name = "Weather", Options = { "None","Rain","Thunderstorm","Snow","Sandstorm" }, Default = "None", AllowNone = false,
+    Callback = function(v) safeSet(WorldAPI, "SetWeather", v, "WorldVis") end })
+WeatherGroup:ColorPicker({ Name = "Weather Color", Default = ACCENT,
+    Callback = function(c) safeSet(WorldAPI, "SetWeatherColor", c, "WorldVis") end })
+WeatherGroup:Toggle({ Name = "Skybox", Default = false,
+    Callback = function(v) safeSet(WorldAPI, "EnableSkybox", v, "WorldVis") end })
+WeatherGroup:Dropdown({ Name = "Skybox Type", Options = { "realistic","Minecraft","blue space","pink","black storm","custom" }, Default = "realistic", AllowNone = false,
+    Callback = function(v) safeSet(WorldAPI, "SetSkyboxType", v, "WorldVis") end })
+WeatherGroup:Toggle({ Name = "Skybox Spin", Default = false,
+    Callback = function(v) safeSet(WorldAPI, "EnableSkyboxSpin", v, "WorldVis") end })
+WeatherGroup:Slider({ Name = "Spin Speed", Min = 5, Max = 180, Step = 1, Default = 30,
+    Callback = function(v) safeSet(WorldAPI, "SetSkyboxSpinSpeed", v, "WorldVis") end })
+
+TexturesGroup:Toggle({ Name = "World Textures", Default = false,
+    Callback = function(v) safeSet(WorldAPI, "EnableTextures", v, "WorldVis") end })
+TexturesGroup:Dropdown({ Name = "Pack", Options = { "minecraft" }, Default = "minecraft", AllowNone = false,
+    Callback = function(v) safeSet(WorldAPI, "SetTexturePack", v, "WorldVis") end })
+TexturesGroup:Toggle({ Name = "ForceField Map", Default = false,
+    Callback = function(v) safeSet(WorldAPI, "EnableFFMap", v, "WorldVis") end })
+TexturesGroup:ColorPicker({ Name = "FF Map Color", Default = Color3.fromRGB(0,170,255),
+    Callback = function(c) safeSet(WorldAPI, "SetFFMapColor", c, "WorldVis") end })
+TexturesGroup:Toggle({ Name = "FF Custom Color", Default = true,
+    Callback = function(v) safeSet(WorldAPI, "SetFFMapChangeColor", v, "WorldVis") end })
+TexturesGroup:Slider({ Name = "FF Transparency", Min = 0, Max = 0.95, Step = 0.05, Default = 0,
+    Callback = function(v) safeSet(WorldAPI, "SetFFMapTransparency", v, "WorldVis") end })
+
+RTXGroup:Toggle({ Name = "RTX", Default = false,
+    Callback = function(v) safeSet(WorldAPI, "EnableRTX", v, "WorldVis") end })
+RTXGroup:ColorPicker({ Name = "RTX Color", Default = Color3.fromRGB(245,215,225),
+    Callback = function(c) safeSet(WorldAPI, "SetRTXColor", c, "WorldVis") end })
+
+--////////////////////////////////////////////////////////////////
+--// 13. SHERIFF TAB
+--////////////////////////////////////////////////////////////////
+local SheriffCombatSub = SheriffTab:SubTab({ Name = "Combat", Icon = "crosshair" })
+local SheriffVisualsSub = SheriffTab:SubTab({ Name = "Visuals & Audio", Icon = "eye" })
+
+local SheriffAimGroup    = SheriffCombatSub:Groupbox({ Name = "silent aim",      Icon = "crosshair",   Side = "Left" })
+local SheriffCompGroup   = SheriffCombatSub:Groupbox({ Name = "adaptive lead",   Icon = "trending-up", Side = "Right" })
+
+local sheriffState = {
+    shootKey    = "E",
+    grabGunKey  = "Y",
+    silentAimOn = true,
+    wallCheck   = false,
+    autoGrabOn  = false,
+}
+
+SheriffAimGroup:Toggle({
+    Name = "silent aim", Flag = "Sheriff_SilentAim", Default = true,
+    Callback = function(v)
+        sheriffState.silentAimOn = v
+        safeSet(SheriffAPI, "EnableSilentAim", v, "Sheriff")
+    end,
+})
+SheriffAimGroup:Keybind({
+    Name = "silent aim key", Flag = "Sheriff_ShootKey", Default = "E",
+    Callback = function(k)
+        if k then
+            sheriffState.shootKey = k.Name or tostring(k)
+            safeSet(SheriffAPI, "SetShootKey", k, "Sheriff")
+        end
+    end,
+})
+
+SheriffAimGroup:Dropdown({
+    Name = "shooting method", Flag = "Sheriff_ShootingMethod",
+    Options = { "Normal", "New (blatant)" }, Default = "New (blatant)", AllowNone = false,
+    Callback = function(v) safeSet(SheriffAPI, "SetShootingMethod", v, "Sheriff") end,
+})
+
+SheriffAimGroup:Toggle({
+    Name = "wall check", Flag = "Sheriff_WallCheck", Default = false,
+    Callback = function(v)
+        sheriffState.wallCheck = v
+        safeSet(SheriffAPI, "SetWallCheck", v, "Sheriff")
+    end,
+})
+
+SheriffAimGroup:Toggle({
+    Name = "auto grab gun", Flag = "Sheriff_AutoGrabGun", Default = false,
+    Callback = function(v)
+        sheriffState.autoGrabOn = v
+        safeSet(SheriffAPI, "SetAutoGrabGun", v, "Sheriff")
+    end,
+})
+SheriffAimGroup:Keybind({
+    Name = "grab gun key", Flag = "Sheriff_GrabGunKey", Default = "Y",
+    Callback = function(k)
+        if k then
+            sheriffState.grabGunKey = k.Name or tostring(k)
+            safeSet(SheriffAPI, "SetGrabGunKey", k, "Sheriff")
+        end
+    end,
+})
+
+SheriffCompGroup:Toggle({
+    Name = "adaptive lead", Flag = "Sheriff_AdaptiveLead", Default = false,
+    Callback = function(v) safeSet(SheriffAPI, "SetAdaptiveLead", v, "Sheriff") end,
+})
+SheriffCompGroup:Slider({
+    Name = "ping compensation", Flag = "Sheriff_PingComp",
+    Min = 0.5, Max = 2.0, Step = 0.01, Default = 1.0,
+    Callback = function(v) safeSet(SheriffAPI, "SetPingCompensation", v, "Sheriff") end,
+})
+SheriffCompGroup:Slider({
+    Name = "bullet speed", Flag = "Sheriff_BulletSpeed",
+    Min = 1000, Max = 5000, Step = 1, Default = 2800,
+    Callback = function(v) safeSet(SheriffAPI, "SetBulletSpeed", v, "Sheriff") end,
+})
+
+local sheriffPredSlider = SheriffCompGroup:Slider({
+    Name = "prediction (ms)", Flag = "Sheriff_Prediction",
+    Min = 0, Max = 200, Step = 1, Default = 50,
+    Callback = function(v) safeSet(SheriffAPI, "SetPrediction", v, "Sheriff") end,
+})
+
+SheriffCompGroup:Toggle({
+    Name = "auto prediction", Flag = "Sheriff_AutoPrediction", Default = true,
+    Callback = function(v) safeSet(SheriffAPI, "EnableAutoPrediction", v, "Sheriff") end,
+})
+
+SheriffCompGroup:Toggle({
+    Name = "auto pred beta", Flag = "Sheriff_AutoPredBeta", Default = false,
+    Callback = function(v) safeSet(SheriffAPI, "EnableAutoPredBeta", v, "Sheriff") end,
+})
+local sheriffBetaSlider = SheriffCompGroup:Slider({
+    Name = "beta prediction (ms)", Flag = "Sheriff_BetaPrediction",
+    Min = 0, Max = 300, Step = 1, Default = 76,
+    Callback = function(v) safeSet(SheriffAPI, "SetAutoPredBetaPrediction", v, "Sheriff") end,
+})
+
+-- Live prediction sync for both sliders
+task.spawn(function()
+    while task.wait(0.1) do
+        if not SheriffAPI then continue end
+        local live = SheriffAPI:GetPrediction()
+        if type(live) == "number" then
+            if SheriffAPI:IsAutoPredictionOn() and sheriffPredSlider then
+                pcall(function()
+                    if sheriffPredSlider.SetValue then sheriffPredSlider:SetValue(live)
+                    elseif sheriffPredSlider.Set then sheriffPredSlider:Set(live)
+                    elseif sheriffPredSlider.Value then sheriffPredSlider.Value = live end
+                end)
+            end
+            if SheriffAPI:IsAutoPredBetaOn() and sheriffBetaSlider then
+                pcall(function()
+                    if sheriffBetaSlider.SetValue then sheriffBetaSlider:SetValue(live)
+                    elseif sheriffBetaSlider.Set then sheriffBetaSlider:Set(live)
+                    elseif sheriffBetaSlider.Value then sheriffBetaSlider.Value = live end
+                end)
+            end
+        end
+    end
+end)
+
+-- Sheriff entries for the keybind HUD (no kill notifier)
+table.insert(TrackedKeybinds, {
+    Name = "Silent Aim",
+    GetKey = function()
+        if SheriffAPI and SheriffAPI.GetShootKey then
+            local ok, k = pcall(function() return SheriffAPI:GetShootKey() end)
+            if ok and k then return k end
+        end
+        return sheriffState.shootKey
+    end,
+    IsActive = function()
+        if not SheriffAPI then return false end
+        local ok, on = pcall(function() return SheriffAPI:IsSilentAimEnabled() end)
+        return ok and on and sheriffState.silentAimOn
+    end,
+})
+table.insert(TrackedKeybinds, {
+    Name = "Auto Grab Gun",
+    GetKey = function()
+        if SheriffAPI and SheriffAPI.GetGrabGunKey then
+            local ok, k = pcall(function() return SheriffAPI:GetGrabGunKey() end)
+            if ok and k then return k end
+        end
+        return sheriffState.grabGunKey
+    end,
+    IsActive = function() return sheriffState.autoGrabOn end,
+})
+table.insert(TrackedKeybinds, {
+    Name = "Wall Check",
+    GetKey = function() return "Always" end,
+    IsActive = function() return sheriffState.wallCheck end,
+})
+
+-- Startup seed
+task.spawn(function()
+    task.wait(1.5)
+    if not SheriffAPI then return end
+    pcall(function() SheriffAPI:EnableAutoPrediction(true) end)
+end)
+
+-- Sheriff Visuals & Audio sub-tab
+local SheriffTargetVisGroup = SheriffVisualsSub:Groupbox({ Name = "Target Visuals", Icon = "user", Side = "Left" })
+local SheriffHitFxGroup    = SheriffVisualsSub:Groupbox({ Name = "Hit Effects & Chams", Icon = "sparkles", Side = "Left" })
+local SheriffTracerGroup   = SheriffVisualsSub:Groupbox({ Name = "Bullet Tracers", Icon = "crosshair", Side = "Right" })
+local SheriffAudioGroup    = SheriffVisualsSub:Groupbox({ Name = "Audio & Feedback", Icon = "volume-2", Side = "Right" })
+
+-- Target Visuals
+SheriffTargetVisGroup:Toggle({
+    Name = "ammo counter", Flag = "Visuals_ShowAmmo", Default = true,
+    Callback = function(v) -- handled by main visuals, placeholder
+    end
+})
+
+SheriffTargetVisGroup:Toggle({
+    Name = "target hud", Flag = "FH_TargetHUD", Default = true,
+    Callback = function(v) safeSet(SheriffAPI, "SetTargetHUD", v, "Sheriff") end,
+})
+SheriffTargetVisGroup:Toggle({
+    Name = "target tracer", Flag = "FH_TargetLine", Default = true,
+    Callback = function(v) safeSet(SheriffAPI, "SetTargetLine", v, "Sheriff") end,
+})
+
+-- Hit Effects & Chams
+SheriffHitFxGroup:Toggle({
+    Name = "hit chams", Flag = "FH_HitChams", Default = true,
+    Callback = function(v) safeSet(SheriffAPI, "SetHitChams", v, "Sheriff") end,
+})
+SheriffHitFxGroup:ColorPicker({
+    Name = "hit chams color", Default = ACCENT,
+    Callback = function(c) safeSet(SheriffAPI, "SetHitChamsColor", c, "Sheriff") end,
+})
+SheriffHitFxGroup:Slider({
+    Name = "hit chams duration", Min = 0.5, Max = 5, Step = 0.1, Default = 2.5,
+    Callback = function(v) safeSet(SheriffAPI, "SetHitChamsDuration", v, "Sheriff") end,
+})
+
+SheriffHitFxGroup:Toggle({
+    Name = "damage indicator", Flag = "FH_DamageIndicator", Default = true,
+    Callback = function(v) safeSet(SheriffAPI, "SetDamageIndicator", v, "Sheriff") end,
+})
+SheriffHitFxGroup:ColorPicker({
+    Name = "damage indicator color", Default = ACCENT,
+    Callback = function(c) safeSet(SheriffAPI, "SetDamageIndicatorColor", c, "Sheriff") end,
+})
+
+SheriffHitFxGroup:Toggle({
+    Name = "hit effects", Flag = "FH_HitEffectsEnabled", Default = true,
+    Callback = function(v) safeSet(SheriffAPI, "SetHitEffect", v, "Sheriff") end,
+})
+SheriffHitFxGroup:ColorPicker({
+    Name = "hit effects color", Default = ACCENT,
+    Callback = function(c) safeSet(SheriffAPI, "SetHitEffectColor", c, "Sheriff") end,
+})
+SheriffHitFxGroup:Dropdown({
+    Name = "effect type", Options = { "Blood Splatter","starlight","heavenly","ribbon","sakura","angel","wind","flow","star" }, Default = "Blood Splatter", AllowNone = false,
+    Callback = function(v) safeSet(SheriffAPI, "SetHitEffectType", v, "Sheriff") end,
+})
+
+-- Bullet Tracers
+SheriffTracerGroup:Toggle({
+    Name = "bullet tracers", Flag = "FH_BulletTracers", Default = true,
+    Callback = function(v) safeSet(SheriffAPI, "SetBulletTracers", v, "Sheriff") end,
+})
+SheriffTracerGroup:ColorPicker({
+    Name = "tracer color", Default = ACCENT,
+    Callback = function(c) safeSet(SheriffAPI, "SetTracerColor", c, "Sheriff") end,
+})
+SheriffTracerGroup:Slider({
+    Name = "tracer lifetime", Min = 1.3, Max = 5.5, Step = 0.1, Default = 5.5,
+    Callback = function(v) safeSet(SheriffAPI, "SetTracerLifetime", v, "Sheriff") end,
+})
+SheriffTracerGroup:Slider({
+    Name = "tracer width", Min = 0.05, Max = 2, Step = 0.01, Default = 0.1,
+    Callback = function(v) safeSet(SheriffAPI, "SetTracerWidth", v, "Sheriff") end,
+})
+
+-- Audio & Feedback
+SheriffAudioGroup:Toggle({
+    Name = "hit sound", Flag = "FH_HitSound", Default = true,
+    Callback = function(v) safeSet(SheriffAPI, "SetHitSound", v, "Sheriff") end,
+})
+SheriffAudioGroup:Dropdown({
+    Name = "sound pack", Options = { "Sparkles", "Neverlose", "Skeet" }, Default = "Sparkles", AllowNone = false,
+    Callback = function(v)
+        local map = {
+            Sparkles = "https://files.catbox.moe/bgy8au.ogg",
+            Neverlose = "110168723447153",
+            Skeet = "5633695679",
+        }
+        safeSet(SheriffAPI, "SetHitSoundId", map[v], "Sheriff")
+    end,
+})
+SheriffAudioGroup:Slider({
+    Name = "volume", Min = 0, Max = 100, Step = 1, Default = 50,
+    Callback = function(v) safeSet(SheriffAPI, "SetHitSoundVolume", v, "Sheriff") end,
+})
+
+--////////////////////////////////////////////////////////////////
+--// 14. COMBINED SETTINGS TAB
+--////////////////////////////////////////////////////////////////
+local ConfigGroup = SettingsTab:Groupbox({ Name = "Configs", Icon = "folder", Side = "Left" })
+local ThemeGroup  = SettingsTab:Groupbox({ Name = "Themes",  Icon = "palette", Side = "Right" })
+
+ConfigGroup:ConfigManager({ FolderName = "neko.cafe" })
+
+ThemeGroup:Toggle({ Name = "Show Keybind List", Default = true,
+    Callback = function(v)
+        if Window._introDone then kbGui.Enabled = v
+        else task.spawn(function() while not Window._introDone do task.wait(0.1) end; kbGui.Enabled = v end) end
+    end })
+ThemeGroup:Toggle({ Name = "Show Decorator", Default = true,
+    Callback = function(v)
+        decoratorVisible = v
+        if decorator then
+            if v and Window.Open and not Window.Minimized then decorator.ImageTransparency = Window._bodyAlpha or 0
+            elseif not v then decorator.ImageTransparency = 1 end
+        end
+    end })
+ThemeGroup:Dropdown({ Name = "Decorator Image", Options = { "waifu", "mei mei" }, Default = "waifu", AllowNone = false,
+    Callback = function(v) setDecorator(v) end })
+ThemeGroup:ThemeManager()
+
+task.spawn(function() while not Window._introDone do task.wait(0.1) end; task.wait(0.5); kbGui.Enabled = true end)
+
+--////////////////////////////////////////////////////////////////
+--// KEYBIND HUD RENDERER
+--////////////////////////////////////////////////////////////////
+local KB_RowInstances = {}
+
+for _, feature in ipairs(TrackedKeybinds) do
+    local row = Instance.new("Frame", rowsHolder)
+    row.Size = UDim2.new(1, 0, 0, 16); row.BackgroundTransparency = 1; row.Visible = false
+    local name = Instance.new("TextLabel", row)
+    name.Size = UDim2.new(0.65, 0, 1, 0); name.BackgroundTransparency = 1
+    name.Text = feature.Name; name.Font = Enum.Font.GothamMedium; name.TextSize = 11
+    name.TextColor3 = Color3.fromRGB(240, 228, 232); name.TextXAlignment = Enum.TextXAlignment.Left
+    local status = Instance.new("TextLabel", row)
+    status.Size = UDim2.new(0.35, 0, 1, 0); status.Position = UDim2.new(0.65, 0, 0, 0)
+    status.BackgroundTransparency = 1; status.Font = Enum.Font.GothamMedium; status.TextSize = 11
+    status.Text = "["..feature.GetKey().."]"; status.TextXAlignment = Enum.TextXAlignment.Right
+    KB_RowInstances[feature.Name] = { Frame = row, StatusLabel = status, NameLabel = name }
+end
+
+local function updateKeybindTheme()
+    local theme = Library.Theme; if not theme then return end
+    mainCard.BackgroundColor3 = theme.Background
+    s1.Color = theme.Background
+    local activeAccent = theme.Accent
+    title.TextColor3 = Color3.fromRGB(240, 228, 232)
+    sep.BackgroundColor3 = activeAccent
+    for _, inst in pairs(KB_RowInstances) do inst.StatusLabel.TextColor3 = activeAccent end
+end
+
+table.insert(Library._themeListeners, updateKeybindTheme)
+task.spawn(function() task.wait(1); updateKeybindTheme() end)
+
+task.spawn(function()
+    while task.wait(0.04) do
+        local active = 0
+        for _, feature in ipairs(TrackedKeybinds) do
+            local inst = KB_RowInstances[feature.Name]
+            if inst then
+                if feature.IsActive() then
+                    active = active + 1
+                    inst.StatusLabel.Text = "["..feature.GetKey().."]"
+                    inst.Frame.Visible = true
+                else
+                    inst.Frame.Visible = false
+                end
+            end
+        end
+        local targetH = active == 0 and 28 or 34 + active * 19
+        game:GetService("TweenService"):Create(mainCard,
+            TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            { Size = UDim2.new(0, 180, 0, targetH) }):Play()
+    end
+end)
