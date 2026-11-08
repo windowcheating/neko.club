@@ -1,0 +1,409 @@
+--// knife-silent-aim.lua
+--// Knife Silent Aim (cursor-targeted throw redirect) + Kill All
+--// Drop-in module. Returns an API table.
+--
+--// Silent throw: right-click (or call API:SilentThrow()) and the knife is
+--// redirected to the alive player nearest your mouse cursor instead of
+--// the vanilla throw. Wall check is optional.
+--//
+--// Kill All: fire the KnifeStabbed / HandleTouched remotes at everyone.
+--
+--// Usage:
+--//   local Knife = loadstring(game:HttpGet("https://raw.githubusercontent.com/YOU/REPO/main/knife-silent-aim.lua"))()
+--//   Knife:SetSilentThrow(true)
+--//   Knife:SetWallCheck(false)
+--//   Knife:KillAll()
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace         = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local Mouse       = LocalPlayer:GetMouse()
+
+local API = {}
+
+-- ============================================================
+-- STATE
+-- ============================================================
+local S = {
+    SilentThrowEnabled = false,
+    WallCheck          = false,
+    AimMode            = "Cursor",   -- "Cursor" | "Nearest"
+    MouseButton        = 2,          -- 1 = left, 2 = right
+    MaxRange           = 600,        -- studs, throw prediction cap
+    PredictionFactor   = 0.95,
+
+    -- remote-call cooldown so we don't spam the server
+    ThrowCooldown      = 0.35,
+    lastThrow          = 0,
+
+    -- kill all cooldown
+    KillCooldown       = 1.0,
+    lastKill           = 0,
+
+    -- mouse button connection handle
+    throwConn          = nil,
+
+    -- originals so we can restore
+    mouseIconWas       = nil,
+}
+
+-- ============================================================
+-- HELPERS
+-- ============================================================
+local function isAlive(plr)
+    if not plr or not plr.Character then return false end
+    local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+    return hum ~= nil and hum.Health > 0
+end
+
+local function getRoot(plr)
+    if not plr or not plr.Character then return nil end
+    return plr.Character:FindFirstChild("HumanoidRootPart")
+end
+
+local function getMyCharacter()
+    local char = LocalPlayer.Character
+    if not char then return nil, nil, nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    local hand = char:FindFirstChild("RightHand") or char:FindFirstChild("Right Arm") or root
+    if not hum or not root then return nil, nil, nil end
+    return char, hum, root, hand
+end
+
+-- Try to get the local player's knife (equipped or in backpack)
+local function getKnife()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local knife = char:FindFirstChild("Knife")
+    if knife then return knife end
+    local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+    if bp then
+        knife = bp:FindFirstChild("Knife")
+        if knife then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                pcall(function() hum:EquipTool(knife) end)
+                task.wait(0.1)
+                return char:FindFirstChild("Knife")
+            end
+        end
+    end
+    return nil
+end
+
+-- Raycast wall check from the player's hand to the target's torso.
+-- Returns true if a wall blocks the throw.
+local function isWallBlocked(targetChar, originPart)
+    if not S.WallCheck then return false end
+    if not targetChar or not originPart then return false end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { LocalPlayer.Character, targetChar, Workspace.CurrentCamera }
+    params.IgnoreWater = true
+    local torso = targetChar:FindFirstChild("UpperTorso")
+        or targetChar:FindFirstChild("Torso")
+        or targetChar:FindFirstChild("HumanoidRootPart")
+    if not torso then return true end
+    local result = Workspace:Raycast(originPart.Position, torso.Position - originPart.Position, params)
+    if not result then return false end
+    if result.Instance and (result.Instance.CanCollide == false or result.Instance.Transparency >= 0.9) then
+        return false
+    end
+    return true
+end
+
+-- Predict where a moving player will be, capped to MaxRange.
+local function predictPosition(targetRoot, originPos)
+    if not targetRoot then return nil end
+    local pos = targetRoot.Position
+    local vel = targetRoot.AssemblyLinearVelocity or Vector3.zero
+    local dist = (pos - originPos).Magnitude
+    local lead = math.clamp(dist / S.MaxRange, 0.05, 1.0) * S.PredictionFactor
+    return pos + vel * lead
+end
+
+-- ============================================================
+-- TARGET SELECTION
+-- ============================================================
+-- Cursor mode: nearest to mouse in screen space.
+-- Nearest mode: nearest in world space.
+local function pickTarget(originPos)
+    local camera = Workspace.CurrentCamera
+    if not camera then return nil end
+
+    local mousePos = UserInputService:GetMouseLocation()
+    local best, bestScore = nil, math.huge
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and isAlive(plr) then
+            local root = getRoot(plr)
+            if root then
+                local screen, onScreen = camera:WorldToViewportPoint(root.Position)
+                local score
+                if S.AimMode == "Cursor" then
+                    local d = (Vector2.new(screen.X, screen.Y) - mousePos).Magnitude
+                    -- penalize off-screen targets heavily so we always prefer visible ones
+                    if not onScreen then d = d + 5000 end
+                    score = d
+                else
+                    score = (root.Position - originPos).Magnitude
+                end
+                if score < bestScore then
+                    bestScore = score
+                    best = plr
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- ============================================================
+-- SILENT THROW
+-- ============================================================
+-- Fire the knife Throw remote at the target position.
+local function doThrow(targetPlr)
+    local char, hum, root, hand = getMyCharacter()
+    if not char or not root then return false, "no character" end
+
+    local knife = getKnife()
+    if not knife then return false, "no knife" end
+
+    local targetRoot = getRoot(targetPlr)
+    if not targetRoot then return false, "target has no root" end
+
+    if isWallBlocked(targetPlr.Character, hand) then
+        return false, "wall"
+    end
+
+    local aimPos = predictPosition(targetRoot, hand.Position)
+    if not aimPos then return false, "no aim pos" end
+
+    -- The Throw remote lives on the knife; sometimes under Events/KnifeThrown
+    local remote = knife:FindFirstChild("Throw")
+        or (knife:FindFirstChild("Events") and knife.Events:FindFirstChild("KnifeThrown"))
+
+    if not (remote and remote:IsA("RemoteEvent")) then
+        return false, "no throw remote"
+    end
+
+    -- Play the throw animation locally so it looks right
+    pcall(function()
+        local animator = hum:FindFirstChildOfClass("Animator")
+        local throwAnim = knife:FindFirstChild("ThrowKnife", true)
+        if animator and throwAnim then
+            animator:LoadAnimation(throwAnim):Play(0.1, 6, 1)
+        end
+    end)
+
+    -- Handle frame first (matches vanilla), then the aim position
+    local handle = knife:FindFirstChild("Handle")
+    local originCF = handle and handle.CFrame or CFrame.new(hand.Position)
+    pcall(function()
+        remote:FireServer(originCF, CFrame.new(aimPos))
+    end)
+
+    S.lastThrow = tick()
+    return true
+end
+
+-- Public: silent throw at the currently-picked target.
+function API:SilentThrow()
+    if tick() - S.lastThrow < S.ThrowCooldown then
+        return false, "cooldown"
+    end
+    local _, _, root = getMyCharacter()
+    if not root then return false, "no character" end
+    local target = pickTarget(root.Position)
+    if not target then return false, "no target" end
+    return doThrow(target)
+end
+
+-- Rebind / unbind the mouse hook.
+local function refreshThrowHook()
+    if S.throwConn then
+        S.throwConn:Disconnect()
+        S.throwConn = nil
+    end
+    if not S.SilentThrowEnabled then return end
+
+    local downEvent = S.MouseButton == 2 and Mouse.Button2Down or Mouse.Button1Down
+    S.throwConn = downEvent:Connect(function()
+        pcall(API.SilentThrow, API)
+    end)
+end
+
+function API:SetSilentThrow(enabled)
+    S.SilentThrowEnabled = enabled and true or false
+    refreshThrowHook()
+end
+
+function API:IsSilentThrowEnabled()
+    return S.SilentThrowEnabled
+end
+
+function API:SetWallCheck(enabled)
+    S.WallCheck = enabled and true or false
+end
+
+function API:SetAimMode(mode)
+    S.AimMode = (mode == "Nearest") and "Nearest" or "Cursor"
+end
+
+function API:SetMouseButton(button)
+    S.MouseButton = (button == 1) and 1 or 2
+    refreshThrowHook()
+end
+
+function API:SetMaxRange(studs)
+    S.MaxRange = math.clamp(tonumber(studs) or 600, 50, 2000)
+end
+
+function API:SetPredictionFactor(f)
+    S.PredictionFactor = math.clamp(tonumber(f) or 0.95, 0, 2)
+end
+
+function API:SetCooldown(seconds)
+    S.ThrowCooldown = math.max(0, tonumber(seconds) or 0.35)
+end
+
+function API:GetTarget()
+    local _, _, root = getMyCharacter()
+    if not root then return nil end
+    return pickTarget(root.Position)
+end
+
+-- ============================================================
+-- KILL ALL / KILL TARGET
+-- ============================================================
+-- Fires KnifeStabbed + HandleTouched for every alive player.
+function API:KillAll()
+    if tick() - S.lastKill < S.KillCooldown then
+        return 0, "cooldown"
+    end
+
+    local char = LocalPlayer.Character
+    if not char then return 0, "no character" end
+
+    local knife = getKnife()
+    if not knife then return 0, "no knife" end
+
+    local events = knife:FindFirstChild("Events")
+    if not events then return 0, "no events folder" end
+
+    local stabbed = events:FindFirstChild("KnifeStabbed")
+    local touched = events:FindFirstChild("HandleTouched")
+    if not (stabbed and touched) then return 0, "missing remotes" end
+
+    -- One stab signal (tells the server the knife is active)
+    pcall(function() stabbed:FireServer() end)
+
+    local count = 0
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and isAlive(plr) then
+            local targetPart = plr.Character:FindFirstChild("HumanoidRootPart")
+                or plr.Character:FindFirstChild("UpperTorso")
+                or plr.Character:FindFirstChild("Torso")
+                or plr.Character:FindFirstChildWhichIsA("BasePart")
+            if targetPart then
+                pcall(function() touched:FireServer(targetPart) end)
+                count += 1
+            end
+        end
+    end
+
+    S.lastKill = tick()
+    return count
+end
+
+-- Kill a single named player (or the currently-picked target if nil).
+function API:KillTarget(playerName)
+    if tick() - S.lastKill < S.KillCooldown then
+        return false, "cooldown"
+    end
+
+    local target
+    if playerName and playerName ~= "" then
+        target = Players:FindFirstChild(playerName)
+    else
+        local _, _, root = getMyCharacter()
+        if root then target = pickTarget(root.Position) end
+    end
+    if not target then return false, "no target" end
+    if not isAlive(target) then return false, "target dead" end
+
+    local char = LocalPlayer.Character
+    if not char then return false, "no character" end
+
+    local knife = getKnife()
+    if not knife then return false, "no knife" end
+
+    local events = knife:FindFirstChild("Events")
+    if not events then return false, "no events" end
+
+    local stabbed = events:FindFirstChild("KnifeStabbed")
+    local touched = events:FindFirstChild("HandleTouched")
+    if not (stabbed and touched) then return false, "missing remotes" end
+
+    pcall(function() stabbed:FireServer() end)
+
+    local targetPart = target.Character:FindFirstChild("HumanoidRootPart")
+        or target.Character:FindFirstChild("UpperTorso")
+        or target.Character:FindFirstChild("Torso")
+        or target.Character:FindFirstChildWhichIsA("BasePart")
+
+    if not targetPart then return false, "no target part" end
+
+    pcall(function() touched:FireServer(targetPart) end)
+    S.lastKill = tick()
+    return true
+end
+
+function API:SetKillCooldown(seconds)
+    S.KillCooldown = math.max(0, tonumber(seconds) or 1.0)
+end
+
+-- ============================================================
+-- ROLE CHECK (optional convenience)
+-- ============================================================
+-- Returns "Murderer" | "Sheriff" | "Innocent" | nil
+function API:MyRole()
+    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    remotes = remotes and remotes:FindFirstChild("Extras")
+    local getData = remotes and remotes:FindFirstChild("GetPlayerData")
+    if not getData then return nil end
+    local ok, data = pcall(function() return getData:InvokeServer() end)
+    if not ok or type(data) ~= "table" then return nil end
+    local rec = data[LocalPlayer.Name]
+    return rec and rec.Role or nil
+end
+
+-- Returns the player currently holding the knife (murderer), or nil.
+function API:GetMurderer()
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local char = plr.Character
+        local bp = plr:FindFirstChildOfClass("Backpack")
+        if (char and char:FindFirstChild("Knife")) or (bp and bp:FindFirstChild("Knife")) then
+            return plr
+        end
+    end
+    return nil
+end
+
+-- ============================================================
+-- CLEANUP
+-- ============================================================
+function API:Destroy()
+    if S.throwConn then
+        pcall(function() S.throwConn:Disconnect() end)
+        S.throwConn = nil
+    end
+    S.SilentThrowEnabled = false
+end
+
+return API
