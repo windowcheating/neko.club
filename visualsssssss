@@ -1,0 +1,944 @@
+-- visuals.lua — raw feature source (no UI, no toggles)
+-- Self Material / Tool Material / Particle Aura / Tool Aura /
+-- Cursor Pet (Oneko) / Charizard Cursor / Crosshair.
+-- Consumer (AirFlow hub) wires the UI and calls the Enable/Disable/Set methods.
+
+local API = {}
+
+local Services = {
+    Players          = game:GetService("Players"),
+    RunService       = game:GetService("RunService"),
+    UserInputService = game:GetService("UserInputService"),
+    TweenService     = game:GetService("TweenService"),
+    CoreGui          = game:GetService("CoreGui"),
+}
+local LocalPlayer = Services.Players.LocalPlayer
+
+local DEFAULT_ACCENT = Color3.fromHex and Color3.fromHex("#9791df") or Color3.fromRGB(0x97, 0x91, 0xdf)
+local function accent()
+    local nl = getgenv().NeverLose
+    return (nl and nl.AccentColor) or DEFAULT_ACCENT
+end
+
+-- ============================================================
+-- 1) SELF MATERIAL
+-- ============================================================
+local SM = {
+    enabled = false,
+    material = "Neon",
+    color = accent(),
+    transparency = 0,
+    originalData = {},
+    savedClothes = {},
+    savedFaces = {},
+    savedBodyColors = nil,
+    wireframeBoxes = {},
+}
+local targetBodyParts = {
+    Head=true, Torso=true, UpperTorso=true, LowerTorso=true,
+    LeftArm=true, RightArm=true, LeftLeg=true, RightLeg=true,
+    LeftUpperArm=true, LeftLowerArm=true, LeftHand=true,
+    RightUpperArm=true, RightLowerArm=true, RightHand=true,
+    LeftUpperLeg=true, LeftLowerLeg=true, LeftFoot=true,
+    RightUpperLeg=true, RightLowerLeg=true, RightFoot=true,
+}
+
+local function isKorblox(char)
+    if not char then return false end
+    local rll = char:FindFirstChild("RightLowerLeg")
+    local rf  = char:FindFirstChild("RightFoot")
+    if rll and rll.Transparency >= 0.9 then return true end
+    if rf  and rf.Transparency  >= 0.9 then return true end
+    return false
+end
+
+local function smClearWireframe()
+    for _, b in ipairs(SM.wireframeBoxes) do
+        pcall(function() if b and b.Parent then b:Destroy() end end)
+    end
+    SM.wireframeBoxes = {}
+end
+
+local function smHideClothes(char)
+    for _, obj in ipairs(char:GetChildren()) do
+        if obj:IsA("Shirt") or obj:IsA("Pants") or obj:IsA("ShirtGraphic") then
+            table.insert(SM.savedClothes, obj)
+            obj.Parent = nil
+        end
+    end
+end
+
+local function smRestoreClothes(char)
+    for _, obj in ipairs(SM.savedClothes) do
+        if obj and obj:IsA("Instance") and char then obj.Parent = char end
+    end
+    SM.savedClothes = {}
+end
+
+local function smHideFace(char)
+    local head = char and char:FindFirstChild("Head")
+    if not head then return end
+    for _, obj in ipairs(head:GetDescendants()) do
+        if obj:IsA("Decal") then
+            if SM.savedFaces[obj] == nil then SM.savedFaces[obj] = obj.Transparency end
+            obj.Transparency = 1
+        end
+    end
+end
+
+local function smRestoreFace()
+    for d, t in pairs(SM.savedFaces) do
+        if d and d.Parent then pcall(function() d.Transparency = t end) end
+    end
+    SM.savedFaces = {}
+end
+
+local function smApplyBodyColors(char, color)
+    local bc = char and char:FindFirstChildOfClass("BodyColors")
+    if not bc then return end
+    if not SM.savedBodyColors then
+        SM.savedBodyColors = {
+            HeadColor3=bc.HeadColor3, TorsoColor3=bc.TorsoColor3,
+            LeftArmColor3=bc.LeftArmColor3, RightArmColor3=bc.RightArmColor3,
+            LeftLegColor3=bc.LeftLegColor3, RightLegColor3=bc.RightLegColor3,
+        }
+    end
+    bc.HeadColor3 = color; bc.TorsoColor3 = color
+    bc.LeftArmColor3 = color; bc.RightArmColor3 = color
+    bc.LeftLegColor3 = color; bc.RightLegColor3 = color
+end
+
+local function smRestoreBodyColors(char)
+    local bc = char and char:FindFirstChildOfClass("BodyColors")
+    local s = SM.savedBodyColors
+    if bc and s then
+        bc.HeadColor3 = s.HeadColor3; bc.TorsoColor3 = s.TorsoColor3
+        bc.LeftArmColor3 = s.LeftArmColor3; bc.RightArmColor3 = s.RightArmColor3
+        bc.LeftLegColor3 = s.LeftLegColor3; bc.RightLegColor3 = s.RightLegColor3
+    end
+    SM.savedBodyColors = nil
+end
+
+local function smBackup(part)
+    if not SM.originalData[part] then
+        local mesh = part:FindFirstChildOfClass("SpecialMesh")
+        SM.originalData[part] = {
+            Material = part.Material, Color = part.Color, Transparency = part.Transparency,
+            TextureID = part:IsA("MeshPart") and part.TextureID or nil,
+            MeshTexture = mesh and mesh.TextureId or nil,
+        }
+    end
+end
+
+local function smApplyToPart(part, color)
+    if SM.material == "Wireframe" then
+        part.Transparency = 1
+        if part:IsA("MeshPart") then part.TextureID = "" end
+        local mesh = part:FindFirstChildOfClass("SpecialMesh")
+        if mesh then mesh.TextureId = "" end
+        local box = Instance.new("SelectionBox")
+        box.Name = "SM_Wireframe"; box.Adornee = part; box.Color3 = color
+        box.SurfaceTransparency = 1; box.LineThickness = 0.01
+        box.Parent = part
+        table.insert(SM.wireframeBoxes, box)
+    else
+        part.Material = Enum.Material[SM.material] or Enum.Material.Neon
+        part.Color = color
+        if part:IsA("MeshPart") then part.TextureID = "" end
+        local mesh = part:FindFirstChildOfClass("SpecialMesh")
+        if mesh then mesh.TextureId = "" end
+        local sa = part:FindFirstChildOfClass("SurfaceAppearance")
+        if sa then sa:Destroy() end
+        local trans = SM.transparency
+        if SM.material == "Glass" or SM.material == "ForceField" then
+            if trans <= 0 then trans = (SM.material == "Glass") and 0.25 or 0.3 end
+        end
+        part.Transparency = trans
+    end
+end
+
+local function smApply()
+    if not SM.enabled then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    smClearWireframe()
+    for _, part in ipairs(char:GetChildren()) do
+        if part:IsA("BasePart") and targetBodyParts[part.Name] then smBackup(part)
+        elseif part:IsA("Accessory") then
+            for _, d in ipairs(part:GetDescendants()) do
+                if d:IsA("BasePart") then smBackup(d) end
+            end
+        end
+    end
+    smHideClothes(char); smHideFace(char); smApplyBodyColors(char, SM.color)
+    local korblox = isKorblox(char)
+    for _, part in ipairs(char:GetChildren()) do
+        if part:IsA("BasePart") and targetBodyParts[part.Name] then
+            local orig = SM.originalData[part]
+            local hidden = orig and orig.Transparency >= 0.9
+            local kp = korblox and (part.Name == "RightLowerLeg" or part.Name == "RightFoot")
+            if hidden or kp then
+                part.Transparency = 1
+                if part:IsA("MeshPart") then part.TextureID = "" end
+            else
+                smApplyToPart(part, SM.color)
+            end
+        end
+    end
+    for _, part in ipairs(char:GetChildren()) do
+        if part:IsA("Accessory") then
+            for _, d in ipairs(part:GetDescendants()) do
+                if d:IsA("BasePart") then
+                    local orig = SM.originalData[d]
+                    if orig and orig.Transparency >= 0.9 then d.Transparency = 1
+                    else smApplyToPart(d, SM.color) end
+                end
+            end
+        end
+    end
+end
+
+local function smRestore()
+    local char = LocalPlayer.Character
+    smClearWireframe()
+    if char then
+        smRestoreClothes(char); smRestoreFace()
+        for part, data in pairs(SM.originalData) do
+            if part and part.Parent then
+                pcall(function()
+                    part.Material = data.Material; part.Color = data.Color
+                    part.Transparency = data.Transparency
+                    if part:IsA("MeshPart") and data.TextureID then part.TextureID = data.TextureID end
+                    local mesh = part:FindFirstChildOfClass("SpecialMesh")
+                    if mesh and data.MeshTexture then mesh.TextureId = data.MeshTexture end
+                end)
+            end
+        end
+    end
+    smRestoreBodyColors(char)
+    if isKorblox(char) and char then
+        local rll = char:FindFirstChild("RightLowerLeg")
+        local rf  = char:FindFirstChild("RightFoot")
+        if rll then rll.Transparency = 1 end
+        if rf  then rf.Transparency  = 1 end
+    end
+    SM.originalData = {}
+end
+
+function API:EnableSelfMaterial()  SM.enabled = true;  smApply() end
+function API:DisableSelfMaterial() SM.enabled = false; smRestore() end
+function API:ToggleSelfMaterial()  if SM.enabled then self:DisableSelfMaterial() else self:EnableSelfMaterial() end end
+function API:IsSelfMaterialEnabled() return SM.enabled end
+function API:SetSelfMaterialMaterial(m) SM.material = m; if SM.enabled then smApply() end end
+function API:SetSelfMaterialColor(c)    SM.color = c;    if SM.enabled then smApply() end end
+function API:SetSelfMaterialTransparency(t) SM.transparency = t; if SM.enabled then smApply() end end
+
+-- ============================================================
+-- 2) TOOL MATERIAL
+-- ============================================================
+local TM = {
+    enabled = false,
+    material = "Neon",
+    color = accent(),
+    transparency = 0,
+    originalData = {},
+    shellData = {},
+    charConns = {},
+}
+
+local function tmWipe(clone)
+    pcall(function() if clone:IsA("MeshPart") then clone.TextureID = "" end end)
+    for _, d in ipairs(clone:GetDescendants()) do
+        if d:IsA("SurfaceAppearance") or d:IsA("Decal") or d:IsA("Texture") then d:Destroy()
+        elseif d:IsA("SpecialMesh") then d.TextureId = "" end
+    end
+end
+
+local function tmClearForTool(tool)
+    if not tool then return end
+    local entry = TM.shellData[tool]
+    if entry then
+        for _, s in ipairs(entry) do if s and s.Parent then s:Destroy() end end
+    end
+    TM.shellData[tool] = nil
+end
+
+local function tmClearAll()
+    for tool in pairs(TM.shellData) do tmClearForTool(tool) end
+    TM.shellData = {}
+    TM.originalData = {}
+end
+
+local function tmMakeShells(tool)
+    if not tool or not tool:IsA("Tool") then return end
+    if TM.shellData[tool] then return end
+    local shells = {}
+    TM.shellData[tool] = shells
+    for _, part in ipairs(tool:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if not TM.originalData[part] then TM.originalData[part] = { Transparency = part.Transparency } end
+            local shell = part:Clone()
+            shell.Name = "NL_Shell_" .. part.Name
+            shell.CanCollide = false; shell.CanQuery = false; shell.CanTouch = false
+            shell.Massless = true; shell.Anchored = false; shell.CastShadow = false
+            shell.Transparency = 0
+            tmWipe(shell)
+            shell.Material = Enum.Material[TM.material] or Enum.Material.Neon
+            shell.Color = TM.color
+            local trans = TM.transparency
+            if TM.material == "ForceField" and trans <= 0 then trans = 0.35 end
+            shell.Transparency = trans
+            shell.Size = part.Size + Vector3.new(0.02, 0.02, 0.02)
+            shell.Parent = part
+            shell.CFrame = part.CFrame
+            local weld = Instance.new("WeldConstraint")
+            weld.Part0 = part; weld.Part1 = shell; weld.Parent = shell
+            part.Transparency = 1
+            table.insert(shells, shell)
+        end
+    end
+end
+
+local function tmUpdateStyle(tool)
+    local shells = TM.shellData[tool]
+    if not shells then return end
+    for _, shell in ipairs(shells) do
+        if shell and shell.Parent then
+            shell.Material = Enum.Material[TM.material] or Enum.Material.Neon
+            shell.Color = TM.color
+            local trans = TM.transparency
+            if TM.material == "ForceField" and trans <= 0 then trans = 0.35 end
+            shell.Transparency = trans
+        end
+    end
+end
+
+local function tmApplyToTool(tool)
+    if not tool or not tool:IsA("Tool") then return end
+    if TM.enabled then
+        if TM.shellData[tool] then tmUpdateStyle(tool) else tmMakeShells(tool) end
+    else tmClearForTool(tool) end
+end
+
+local function tmApplyAll()
+    local char = LocalPlayer.Character
+    if char then for _, c in ipairs(char:GetChildren()) do if c:IsA("Tool") then tmApplyToTool(c) end end end
+    local bp = LocalPlayer.Backpack
+    if bp then for _, c in ipairs(bp:GetChildren()) do if c:IsA("Tool") then tmApplyToTool(c) end end end
+end
+
+local function tmHookChar(char)
+    if TM.charConns[char] then return end
+    TM.charConns[char] = true
+    char.ChildAdded:Connect(function(c) if c:IsA("Tool") then task.wait(0.2); tmApplyToTool(c) end end)
+    char.ChildRemoved:Connect(function(c) if c:IsA("Tool") then tmClearForTool(c) end end)
+end
+
+if LocalPlayer.Character then tmHookChar(LocalPlayer.Character) end
+LocalPlayer.CharacterAdded:Connect(function(c) task.wait(1); tmHookChar(c); tmApplyAll() end)
+if LocalPlayer.Backpack then
+    LocalPlayer.Backpack.ChildAdded:Connect(function(c) if c:IsA("Tool") then task.wait(0.2); tmApplyToTool(c) end end)
+end
+LocalPlayer.CharacterRemoving:Connect(tmClearAll)
+
+task.spawn(function()
+    while task.wait(0.5) do if TM.enabled then tmApplyAll() end end
+end)
+
+function API:EnableToolMaterial()  TM.enabled = true;  tmApplyAll() end
+function API:DisableToolMaterial() TM.enabled = false; tmClearAll() end
+function API:ToggleToolMaterial()  if TM.enabled then self:DisableToolMaterial() else self:EnableToolMaterial() end end
+function API:IsToolMaterialEnabled() return TM.enabled end
+function API:SetToolMaterialMaterial(m) TM.material = m; if TM.enabled then tmApplyAll() end end
+function API:SetToolMaterialColor(c)    TM.color = c;    if TM.enabled then tmApplyAll() end end
+function API:SetToolMaterialTransparency(t) TM.transparency = t; if TM.enabled then tmApplyAll() end end
+
+-- ============================================================
+-- 3) PARTICLE AURA
+-- ============================================================
+local PA = { enabled = false, color = accent(), currentAura = "angel", particles = {}, auraObjects = {}, charConn = nil }
+local AURA_IDS = {
+    starlight = "rbxassetid://134645216613107",
+    heavenly  = "rbxassetid://139300897520961",
+    ribbon    = "rbxassetid://132069507632161",
+    sakura    = "rbxassetid://81755778619404",
+    angel     = "rbxassetid://97658130917593",
+    wind      = "rbxassetid://80694081850877",
+    flow      = "rbxassetid://119913533725648",
+    star      = "rbxassetid://73754563740680",
+}
+
+local function paDestroy()
+    for _, p in ipairs(PA.particles) do pcall(function() p:Destroy() end) end
+    PA.particles = {}
+end
+
+local function paGetModel(name)
+    if PA.auraObjects[name] then return PA.auraObjects[name] end
+    local id = AURA_IDS[name]; if not id then return nil end
+    local ok, model = pcall(function() return game:GetObjects(id)[1] end)
+    if ok and model then PA.auraObjects[name] = model; return model end
+    return nil
+end
+
+local function paApply()
+    paDestroy()
+    local char = LocalPlayer.Character
+    if not char or not PA.enabled then return end
+    local model = paGetModel(PA.currentAura); if not model then return end
+    local clone = model:Clone()
+    local seq = ColorSequence.new(PA.color)
+    for _, d in ipairs(clone:GetDescendants()) do
+        if d.ClassName == "PointLight" then d.Color = PA.color
+        elseif d.ClassName == "ParticleEmitter" or d.ClassName == "Beam" or d.ClassName == "Trail" then d.Color = seq end
+    end
+    for _, child in ipairs(clone:GetChildren()) do
+        local bodyPart = char:FindFirstChild(child.Name)
+        if bodyPart then
+            for _, sub in ipairs(child:GetChildren()) do
+                sub.Parent = bodyPart; table.insert(PA.particles, sub)
+            end
+        end
+    end
+    clone:Destroy()
+end
+
+function API:EnableParticleAura()
+    PA.enabled = true; paApply()
+    if PA.charConn then PA.charConn:Disconnect() end
+    PA.charConn = LocalPlayer.CharacterAdded:Connect(function() task.wait(0.5); paApply() end)
+end
+function API:DisableParticleAura()
+    PA.enabled = false
+    if PA.charConn then PA.charConn:Disconnect(); PA.charConn = nil end
+    paDestroy()
+end
+function API:ToggleParticleAura() if PA.enabled then self:DisableParticleAura() else self:EnableParticleAura() end end
+function API:IsParticleAuraEnabled() return PA.enabled end
+function API:SetParticleAuraColor(c) PA.color = c; if PA.enabled then paApply() end end
+function API:SetParticleAuraType(t)  PA.currentAura = t; if PA.enabled then paApply() end end
+
+-- ============================================================
+-- 4) TOOL AURA
+-- ============================================================
+local TA = { enabled = false, color = accent(), rateMultiplier = 0.1, particles = {}, charConns = {} }
+
+local function taClear()
+    for _, p in ipairs(TA.particles) do pcall(function() if p and p.Parent then p:Destroy() end end) end
+    TA.particles = {}
+end
+
+local function taUpdateColor()
+    for _, p in ipairs(TA.particles) do
+        if p and p:IsA("ParticleEmitter") then pcall(function() p.Color = ColorSequence.new(TA.color) end) end
+    end
+end
+
+local function taCreateOnPart(parent)
+    if not TA.enabled then return end
+    local e = Instance.new("ParticleEmitter")
+    e.Texture = "rbxassetid://10927170198"
+    e.LightEmission = -5; e.Brightness = 10; e.ZOffset = 1; e.LightInfluence = 0
+    e.Orientation = Enum.ParticleOrientation.VelocityPerpendicular
+    e.Color = ColorSequence.new(TA.color)
+    e.EmissionDirection = Enum.NormalId.Top
+    e.Lifetime = NumberRange.new(0.5)
+    e.Rotation = NumberRange.new(0, 360)
+    e.RotSpeed = NumberRange.new(1250)
+    e.Speed = NumberRange.new(0.165)
+    e.SpreadAngle = Vector2.new(-360, 360)
+    pcall(function()
+        e.Shape = Enum.ParticleEmitterShape.Box
+        e.ShapeInOut = Enum.ParticleEmitterShapeInOut.Outward
+        e.ShapeStyle = Enum.ParticleEmitterShapeStyle.Volume
+    end)
+    e.Rate = 49 * TA.rateMultiplier
+    e.Enabled = true
+    e.Parent = parent
+    table.insert(TA.particles, e)
+end
+
+local function taApply(tool)
+    taClear()
+    if not TA.enabled then return end
+    local handle = tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart")
+    if handle then taCreateOnPart(handle) end
+end
+
+local function taHook(char)
+    if TA.charConns[char] then return end
+    TA.charConns[char] = true
+    char.ChildAdded:Connect(function(c) if c:IsA("Tool") then task.defer(function() taApply(c) end) end end)
+    char.ChildRemoved:Connect(function(c) if c:IsA("Tool") then taClear() end end)
+    local tool = char:FindFirstChildOfClass("Tool")
+    if tool then taApply(tool) end
+end
+
+if LocalPlayer.Character then task.spawn(taHook, LocalPlayer.Character) end
+LocalPlayer.CharacterAdded:Connect(taHook)
+
+function API:EnableToolAura()
+    TA.enabled = true
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if tool then taApply(tool) end
+end
+function API:DisableToolAura() TA.enabled = false; taClear() end
+function API:ToggleToolAura() if TA.enabled then self:DisableToolAura() else self:EnableToolAura() end end
+function API:IsToolAuraEnabled() return TA.enabled end
+function API:SetToolAuraColor(c) TA.color = c; taUpdateColor() end
+function API:SetToolAuraRate(r)
+    TA.rateMultiplier = r
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if tool and TA.enabled then taApply(tool) end
+end
+
+-- ============================================================
+-- 5) CURSOR PET (ONEKO)
+-- ============================================================
+local OP = {
+    enabled = false, followTarget = true, color = accent(),
+    size = 28, speed = 110, followDistance = 45, animSpeed = 0.13,
+}
+local ONEKO_PATH = "NLAssets/oneko.png"
+local ONEKO_URL  = "https://files.catbox.moe/twwjix.png"
+
+task.spawn(function()
+    if not isfolder("NLAssets") then makefolder("NLAssets") end
+    if not isfile(ONEKO_PATH) then
+        local ok, body = pcall(function() return game:HttpGet(ONEKO_URL) end)
+        if ok and body then writefile(ONEKO_PATH, body) end
+    end
+end)
+
+if getgenv().__NL_OnekoGui then pcall(function() getgenv().__NL_OnekoGui:Destroy() end) end
+local gui = Instance.new("ScreenGui")
+gui.Name = "NL_OnekoCat"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+local pOk = pcall(function() gui.Parent = Services.CoreGui end)
+if not pOk then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+getgenv().__NL_OnekoGui = gui
+
+local img = Instance.new("ImageLabel")
+img.Name = "Cat"
+img.BackgroundTransparency = 1
+img.Size = UDim2.fromOffset(OP.size, OP.size)
+img.AnchorPoint = Vector2.new(0.5, 0.5)
+img.ImageColor3 = OP.color
+img.ImageRectSize = Vector2.new(32, 32)
+img.Visible = false
+img.Parent = gui
+
+task.spawn(function()
+    task.wait(0.2)
+    if isfile(ONEKO_PATH) then
+        local get = getcustomasset or getsynasset
+        if get then img.Image = get(ONEKO_PATH) end
+    end
+end)
+
+local FRAMES = {
+    idle={{3,3}}, N={{1,2},{1,3}}, NE={{0,2},{0,3}}, E={{3,0},{3,1}},
+    SE={{5,1},{5,2}}, S={{6,3},{7,2}}, SW={{5,3},{6,1}}, W={{4,2},{4,3}},
+    NW={{1,0},{1,1}}, tired={{3,2}}, sleeping={{2,0},{2,1}}, scratchSelf={{5,0},{6,0},{7,0}},
+}
+local cam = workspace.CurrentCamera
+local petPos = cam.ViewportSize / 2
+local state, frame, timer = "idle", 1, 0
+local special, specialFrame = nil, 1
+
+local function setFrame(s, f)
+    local frames = FRAMES[s]; if not frames then return end
+    local p = frames[(f - 1) % #frames + 1]
+    img.ImageRectOffset = Vector2.new(p[1] * 32, p[2] * 32)
+end
+
+local function setState(s)
+    if state ~= s then state, frame, timer = s, 1, 0; setFrame(s, 1) end
+end
+
+local function dirFromVec(dx, dy)
+    local a = math.deg(math.atan2(-dy, dx))
+    if a >= -22.5 and a < 22.5 then return "E"
+    elseif a >= 22.5 and a < 67.5 then return "NE"
+    elseif a >= 67.5 and a < 112.5 then return "N"
+    elseif a >= 112.5 and a < 157.5 then return "NW"
+    elseif a >= 157.5 or a < -157.5 then return "W"
+    elseif a >= -157.5 and a < -112.5 then return "SW"
+    elseif a >= -112.5 and a < -67.5 then return "S"
+    else return "SE" end
+end
+
+setFrame("idle", 1)
+
+getgenv().__NL_OnekoConn = Services.RunService.RenderStepped:Connect(function(dt)
+    if not OP.enabled then img.Visible = false; return end
+    img.Visible = true
+    img.ImageColor3 = OP.color
+    img.Size = UDim2.fromOffset(OP.size, OP.size)
+
+    local targetPos
+    if OP.followTarget then
+        local target = (getgenv().Config and getgenv().Config.ForceHit and getgenv().Config.ForceHit.Target)
+            or (getgenv().KillAura and getgenv().KillAura.CurrentTarget)
+        if target and target.Character then
+            local head = target.Character:FindFirstChild("Head") or target.Character:FindFirstChild("HumanoidRootPart")
+            if head then
+                local sp, on = cam:WorldToViewportPoint(head.Position)
+                if on then targetPos = Vector2.new(sp.X, sp.Y) end
+            end
+        end
+        targetPos = targetPos or Services.UserInputService:GetMouseLocation()
+        local diff = targetPos - petPos
+        local dist = diff.Magnitude
+        if dist > OP.followDistance then
+            special, specialFrame = nil, 1
+            local dir = diff.Unit
+            petPos = petPos + dir * math.min(OP.speed * dt, dist - OP.followDistance)
+            setState(dirFromVec(diff.X, diff.Y))
+            timer = timer + dt
+            if timer >= OP.animSpeed then
+                timer = 0; frame = frame + 1
+                if frame > #FRAMES[state] then frame = 1 end
+                setFrame(state, frame)
+            end
+        else
+            setState("idle")
+            specialFrame = specialFrame + dt
+            if not special and specialFrame > 3 and math.random() < 0.01 then
+                special = math.random(1, 2) == 1 and "sleeping" or "scratchSelf"
+                specialFrame = 1; timer = 0
+            end
+            if special then
+                timer = timer + dt
+                if timer >= OP.animSpeed then
+                    timer = 0; specialFrame = specialFrame + 1
+                    if specialFrame > #FRAMES[special] * 6 then
+                        special, specialFrame = nil, 1; setFrame("idle", 1)
+                    else
+                        setFrame(special, math.ceil(specialFrame / 6))
+                    end
+                end
+            end
+        end
+    end
+
+    local vp = cam.ViewportSize
+    local half = OP.size / 2
+    petPos = Vector2.new(math.clamp(petPos.X, half, vp.X - half), math.clamp(petPos.Y, half, vp.Y - half))
+    img.Position = UDim2.fromOffset(petPos.X, petPos.Y)
+end)
+
+function API:EnableCursorPet()  OP.enabled = true end
+function API:DisableCursorPet() OP.enabled = false; img.Visible = false end
+function API:ToggleCursorPet()  if OP.enabled then self:DisableCursorPet() else self:EnableCursorPet() end end
+function API:IsCursorPetEnabled() return OP.enabled end
+function API:SetCursorPetColor(c) OP.color = c end
+function API:SetCursorPetFollowTarget(v) OP.followTarget = v end
+function API:SetCursorPetSpeed(v) OP.speed = v end
+function API:SetCursorPetDistance(v) OP.followDistance = v end
+
+-- ============================================================
+-- 6) CHARIZARD CURSOR
+-- ============================================================
+local CH = { enabled = false, mode = "Shoulder", color = Color3.fromHex("#706669") }
+local CH_PATH = "NLAssets/charizard_sprite_2d.png"
+local CH_URL  = "https://files.catbox.moe/ujwejs.png"
+
+local function fetchCharizard()
+    local get = getcustomasset or getsynasset
+    if not get then return "" end
+    if not isfolder("NLAssets") then makefolder("NLAssets") end
+    if not isfile(CH_PATH) then
+        local ok, body = pcall(function() return game:HttpGet(CH_URL) end)
+        if ok and body and #body > 100 then writefile(CH_PATH, body) end
+    end
+    if isfile(CH_PATH) then return get(CH_PATH) end
+    return ""
+end
+
+if getgenv().__NL_CharizardGui then pcall(function() getgenv().__NL_CharizardGui:Destroy() end) end
+local cGui = Instance.new("ScreenGui")
+cGui.Name = "NL_Charizard2D"
+cGui.ResetOnSpawn = false
+cGui.IgnoreGuiInset = true
+local cOk = pcall(function() cGui.Parent = Services.CoreGui end)
+if not cOk then cGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+getgenv().__NL_CharizardGui = cGui
+
+local holder = Instance.new("Frame")
+holder.Name = "CharizardHolder"
+holder.BackgroundTransparency = 1
+holder.BorderSizePixel = 0
+holder.ClipsDescendants = true
+holder.AnchorPoint = Vector2.new(0.5, 0.5)
+holder.Size = UDim2.fromOffset(80, 80)
+holder.Visible = false
+holder.Parent = cGui
+
+local sheet = Instance.new("ImageLabel")
+sheet.Name = "Sheet"
+sheet.BackgroundTransparency = 1
+sheet.BorderSizePixel = 0
+sheet.ResampleMode = Enum.ResamplerMode.Pixelated
+sheet.ScaleType = Enum.ScaleType.Stretch
+sheet.Position = UDim2.new(0,0,0,0)
+sheet.Parent = holder
+
+-- ujwejs.png is the original 1040x910 spritesheet with 8 columns x 51 frames.
+local chFrame, chTimer = 0, 0
+local CH_W, CH_H, CH_FW, CH_COLS, CH_TOTAL = 1040, 910, 130, 8, 51
+local CH_SIZE, CH_FPS = 80, 0.045
+
+task.spawn(function()
+    task.wait(0.2)
+    local a = fetchCharizard()
+    if a == "" then
+        warn("[Charizard] asset failed to load — check NLAssets/charizard_sprite_2d.png")
+        return
+    end
+    sheet.Image = a
+    sheet.Size = UDim2.fromOffset(CH_W * (CH_SIZE / CH_FW), CH_H * (CH_SIZE / CH_FW))
+end)
+
+getgenv().__NL_CharizardConn = Services.RunService.RenderStepped:Connect(function(dt)
+    if not CH.enabled then holder.Visible = false; return end
+    local screenPos
+    local mode = CH.mode
+    if mode == "Follow Target" then
+        local target = (getgenv().Config and getgenv().Config.ForceHit and getgenv().Config.ForceHit.Target)
+            or (getgenv().KillAura and getgenv().KillAura.CurrentTarget)
+        if target and target.Character then
+            local head = target.Character:FindFirstChild("Head") or target.Character:FindFirstChild("HumanoidRootPart")
+            if head then
+                local sp, on = cam:WorldToViewportPoint(head.Position + Vector3.new(0, 1.5, 0))
+                if on then screenPos = Vector2.new(sp.X, sp.Y) end
+            end
+        end
+    elseif mode == "Above Tool" then
+        local char = LocalPlayer.Character
+        local tool = char and char:FindFirstChildOfClass("Tool")
+        if tool then
+            local h = tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart")
+            if h then
+                local sp, on = cam:WorldToViewportPoint(h.Position + Vector3.new(0, 1.2, 0))
+                if on then screenPos = Vector2.new(sp.X, sp.Y) end
+            end
+        end
+    elseif mode == "Shoulder" then
+        local char = LocalPlayer.Character
+        local shoulder = char and (char:FindFirstChild("RightUpperArm") or char:FindFirstChild("Right Arm"))
+        if shoulder then
+            local wp = shoulder.Position + Vector3.new(0, 1.4, 0) - shoulder.CFrame.LookVector * 0.4
+            local sp, on = cam:WorldToViewportPoint(wp)
+            if on then screenPos = Vector2.new(sp.X, sp.Y) end
+        end
+    elseif mode == "Mouse" then
+        local m = Services.UserInputService:GetMouseLocation()
+        screenPos = Vector2.new(m.X, m.Y)
+    end
+    if not screenPos then
+        local m = Services.UserInputService:GetMouseLocation()
+        screenPos = Vector2.new(m.X, m.Y)
+    end
+
+    holder.Visible = true
+    sheet.ImageColor3 = CH.color
+    holder.Size = UDim2.fromOffset(CH_SIZE, CH_SIZE)
+    holder.Position = UDim2.fromOffset(screenPos.X, screenPos.Y)
+
+    chTimer = chTimer + dt
+    while chTimer >= CH_FPS do
+        chTimer = chTimer - CH_FPS
+        chFrame = (chFrame + 1) % CH_TOTAL
+    end
+    local col = chFrame % CH_COLS
+    local row = math.floor(chFrame / CH_COLS)
+    local scale = CH_SIZE / CH_FW
+    sheet.Size = UDim2.fromOffset(CH_W * scale, CH_H * scale)
+    sheet.Position = UDim2.fromOffset(-col * CH_SIZE, -row * CH_SIZE)
+end)
+
+function API:EnableCharizardCursor()  CH.enabled = true end
+function API:DisableCharizardCursor() CH.enabled = false; holder.Visible = false end
+function API:ToggleCharizardCursor()  if CH.enabled then self:DisableCharizardCursor() else self:EnableCharizardCursor() end end
+function API:IsCharizardCursorEnabled() return CH.enabled end
+function API:SetCharizardColor(c) CH.color = c end
+function API:SetCharizardMode(m)  CH.mode = m end
+
+-- ============================================================
+-- 7) CROSSHAIR
+-- ============================================================
+local XH = {
+    enabled = false, position = "mouse", hideGameCrosshair = false,
+    lines = 4, radius = 14, length = 9, thickness = 2, rotation = 0,
+    color = accent(), outlineColor = Color3.fromRGB(0,0,0),
+    spin = true, spinSpeed = 120, pulse = true, pulseSpeed = 4,
+    gapPulse = 5, sizePulse = 6,
+    text = true,
+    textPrefix = "neko",
+    textSuffix = ".cafe",
+    textPos = "bottom right",
+    textColor       = Color3.fromRGB(255,255,255),
+    textAccentColor = accent(),
+}
+
+local lines, outlines = {}, {}
+local xhText       = Drawing.new("Text")
+local xhTextSuffix = Drawing.new("Text")
+for _, t in ipairs({ xhText, xhTextSuffix }) do
+    t.Font = 2; t.Size = 13; t.Outline = true
+    t.OutlineColor = Color3.fromRGB(0,0,0); t.ZIndex = 3
+end
+xhText.Color       = XH.textColor
+xhTextSuffix.Color = XH.textAccentColor
+local xhRot = 0
+
+local function ensureCount(n)
+    while #lines > n do
+        local l = table.remove(lines); local o = table.remove(outlines)
+        if l then l:Remove() end; if o then o:Remove() end
+    end
+    while #lines < n do
+        local o = Drawing.new("Line"); o.ZIndex = 1; table.insert(outlines, o)
+        local l = Drawing.new("Line"); l.ZIndex = 2; table.insert(lines, l)
+    end
+end
+
+local function setGameCrosshairVisible(v)
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    local ms = pg and pg:FindFirstChild("Main Screen")
+    if ms then
+        local aim = ms:FindFirstChild("Aim")
+        if aim and aim:IsA("GuiObject") then aim.Visible = v end
+    end
+end
+
+local function xhPos()
+    local m = Services.UserInputService:GetMouseLocation()
+    if XH.position == "mouse" then return m end
+    if XH.position == "gun tip" then
+        local char = LocalPlayer.Character
+        local tool = char and char:FindFirstChildOfClass("Tool")
+        local h = tool and (tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart"))
+        if h then
+            local sp, on = cam:WorldToViewportPoint(h.Position)
+            if on then return Vector2.new(sp.X, sp.Y) end
+        end
+        return m
+    end
+    if XH.position == "target" then
+        local target = (getgenv().Config and getgenv().Config.ForceHit and getgenv().Config.ForceHit.Target)
+            or (getgenv().KillAura and getgenv().KillAura.CurrentTarget)
+        if target and target.Character then
+            local part = target.Character:FindFirstChild("Head") or target.Character:FindFirstChild("HumanoidRootPart")
+            if part then
+                local sp, on = cam:WorldToViewportPoint(part.Position)
+                if on then return Vector2.new(sp.X, sp.Y) end
+            end
+        end
+        return m
+    end
+    return m
+end
+
+getgenv().__NL_CrosshairConn = Services.RunService.RenderStepped:Connect(function(dt)
+    if not XH.enabled then
+        for i = 1, #lines do lines[i].Visible = false; outlines[i].Visible = false end
+        xhText.Visible = false
+        xhTextSuffix.Visible = false
+        return
+    end
+    if XH.hideGameCrosshair then setGameCrosshairVisible(false) end
+    local center = xhPos()
+    if XH.spin then xhRot = (xhRot + XH.spinSpeed * dt) % 360 end
+    local pulse = XH.pulse and math.sin(tick() * XH.pulseSpeed) or 0
+    local radius = math.max(1, XH.radius + pulse * XH.gapPulse)
+    local outer = radius + math.max(2, XH.length + pulse * XH.sizePulse)
+    ensureCount(XH.lines)
+    local step = 2 * math.pi / XH.lines
+    local rot = math.rad(xhRot + XH.rotation)
+    for i = 1, XH.lines do
+        local l = lines[i]; local o = outlines[i]
+        local a = rot + (i - 1) * step
+        local dx, dy = math.cos(a), math.sin(a)
+        o.From = center + Vector2.new(dx * (radius - 0.5), dy * (radius - 0.5))
+        o.To   = center + Vector2.new(dx * (outer + 0.5), dy * (outer + 0.5))
+        o.Color = XH.outlineColor; o.Thickness = XH.thickness + 1.5; o.Visible = true
+        l.From = center + Vector2.new(dx * radius, dy * radius)
+        l.To   = center + Vector2.new(dx * outer, dy * outer)
+        l.Color = XH.color; l.Thickness = XH.thickness; l.Visible = true
+    end
+    if XH.text and (XH.textPrefix ~= "" or XH.textSuffix ~= "") then
+        xhText.Text        = XH.textPrefix
+        xhTextSuffix.Text  = XH.textSuffix
+        xhText.Color       = XH.textColor
+        xhTextSuffix.Color = XH.textAccentColor
+        local prefixW = xhText.TextBounds.X
+        local totalW  = prefixW + xhTextSuffix.TextBounds.X
+        local p
+        if XH.textPos == "bottom right" then
+            p = center + Vector2.new(outer + 14, outer + 12)
+        else
+            p = center + Vector2.new(-(outer + 14 + totalW), outer + 12)
+        end
+        xhText.Position       = p
+        xhTextSuffix.Position = p + Vector2.new(prefixW, 0)
+        xhText.Visible        = true
+        xhTextSuffix.Visible  = true
+    else
+        xhText.Visible = false
+        xhTextSuffix.Visible = false
+    end
+end)
+
+function API:EnableCrosshair() XH.enabled = true end
+function API:DisableCrosshair()
+    XH.enabled = false
+    if XH.hideGameCrosshair then setGameCrosshairVisible(true) end
+end
+function API:ToggleCrosshair() if XH.enabled then self:DisableCrosshair() else self:EnableCrosshair() end end
+function API:IsCrosshairEnabled() return XH.enabled end
+function API:SetCrosshairColor(c) XH.color = c end
+function API:SetCrosshairTextColor(c)   XH.textColor = c end
+function API:SetCrosshairAccentColor(c) XH.textAccentColor = c end
+function API:SetCrosshairPosition(p) XH.position = p end
+function API:SetCrosshairLines(n) XH.lines = n end
+function API:SetCrosshairRadius(n) XH.radius = n end
+function API:SetCrosshairLength(n) XH.length = n end
+function API:SetCrosshairThickness(n) XH.thickness = n end
+function API:SetCrosshairRotation(n) XH.rotation = n end
+function API:SetCrosshairSpin(v) XH.spin = v end
+function API:SetCrosshairSpinSpeed(n) XH.spinSpeed = n end
+function API:SetCrosshairPulse(v) XH.pulse = v end
+function API:SetCrosshairPulseSpeed(n) XH.pulseSpeed = n end
+function API:SetCrosshairGapPulse(n) XH.gapPulse = n end
+function API:SetCrosshairSizePulse(n) XH.sizePulse = n end
+function API:SetCrosshairText(v) XH.text = v end
+function API:SetCrosshairTextString(s)
+    if s == "neko.cafe" or s == "larptic" then
+        XH.textPrefix = "neko"; XH.textSuffix = ".cafe"
+    else
+        XH.textPrefix = s; XH.textSuffix = ""
+    end
+end
+function API:SetCrosshairHideGame(v)
+    XH.hideGameCrosshair = v
+    if not v then setGameCrosshairVisible(true) end
+end
+
+-- ============================================================
+-- Destroy
+-- ============================================================
+function API:Destroy()
+    self:DisableSelfMaterial(); self:DisableToolMaterial()
+    self:DisableParticleAura(); self:DisableToolAura()
+    self:DisableCursorPet();    self:DisableCharizardCursor()
+    self:DisableCrosshair()
+    if gui  and gui.Parent  then gui:Destroy()  end
+    if cGui and cGui.Parent then cGui:Destroy() end
+end
+
+return API
