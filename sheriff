@@ -1,0 +1,561 @@
+-- sheriff.lua — raw Sheriff Combat feature module (no UI, no toggles)
+-- Verbatim port of NeverLarp's Sheriff Combat stack:
+--   Silent Aim / shooting method / wall check / auto grab gun / kill notifier
+--   adaptive lead / ping compensation / bullet speed / prediction / auto pred / auto pred beta
+--   hit visuals (chams / effects / damage indicator / tracers) + hit sound
+-- Consumer (AirFlow hub) wires the UI and calls the Set*/Enable*/Disable* methods.
+
+local API = {}
+
+local Services = {
+    Players           = game:GetService("Players"),
+    RunService        = game:GetService("RunService"),
+    UserInputService  = game:GetService("UserInputService"),
+    ReplicatedStorage = game:GetService("ReplicatedStorage"),
+    SoundService      = game:GetService("SoundService"),
+    TweenService      = game:GetService("TweenService"),
+    Lighting          = game:GetService("Lighting"),
+    Debris            = game:GetService("Debris"),
+    CoreGui           = game:GetService("CoreGui"),
+}
+local LocalPlayer = Services.Players.LocalPlayer
+local tick = tick or os.clock
+
+local DEFAULT_ACCENT = Color3.fromHex and Color3.fromHex("#9791df") or Color3.fromRGB(0x97, 0x91, 0xdf)
+
+local function getRealPing()
+    local ping = 50
+    pcall(function()
+        ping = Services.Players.LocalPlayer:GetNetworkPing() * 1000
+        if ping < 0 then ping = 0 end
+    end)
+    return math.floor(ping + 0.5)
+end
+
+-- ============================================================
+-- STATE
+-- ============================================================
+local S = {
+    SilentAimEnabled   = true,
+    SilentAimNotifier  = false,
+    SilentAimWallCheck = false,
+    ShootingMethod     = "New (blatant)",
+    AutoGrabGun        = false,
+    AdaptiveLead       = false,
+    PingCompensation   = 1.0,
+    BulletSpeed        = 2800,
+    PredictionPing     = 50,
+    AutoPrediction     = true,
+    AutoPredBeta       = false,
+    AutoPredBetaBuffer = 18,
+    AutoPredBetaValue  = 50,
+    Keybinds = {
+        Shoot   = Enum.KeyCode.E,
+        GrabGun = Enum.KeyCode.Y,
+        Throw   = Enum.KeyCode.U,
+    },
+    SilentAimLastTarget = nil,
+    SilentAimLastTargetTime = 0,
+    SilentAimLastHealth = nil,
+}
+
+local roleCache = {}
+
+local function fetchRoles()
+    local ok, data = pcall(function()
+        local remote = Services.ReplicatedStorage:FindFirstChild("GetPlayerData", true)
+        if remote then return remote:InvokeServer() end
+    end)
+    if ok and type(data) == "table" then
+        for k, v in pairs(data) do roleCache[k] = v end
+    end
+end
+
+local function getMurderer()
+    for _, pl in ipairs(Services.Players:GetPlayers()) do
+        if pl ~= LocalPlayer then
+            if (pl.Character and pl.Character:FindFirstChild("Knife"))
+                or (pl.Backpack and pl.Backpack:FindFirstChild("Knife")) then
+                return pl
+            end
+        end
+    end
+    for name, data in pairs(roleCache) do
+        if type(data) == "table" and data.Role == "Murderer" then
+            local pl = Services.Players:FindFirstChild(name)
+            if pl then return pl end
+        end
+    end
+    return nil
+end
+
+local function resolveTarget()
+    local murderer = getMurderer()
+    if murderer and murderer.Character and murderer.Character:FindFirstChild("HumanoidRootPart") then
+        return murderer
+    end
+    local best, bestDist = nil, math.huge
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return nil end
+    for _, pl in ipairs(Services.Players:GetPlayers()) do
+        if pl ~= LocalPlayer and pl.Character then
+            local root = pl.Character:FindFirstChild("HumanoidRootPart")
+            local hum = pl.Character:FindFirstChildOfClass("Humanoid")
+            if root and hum and hum.Health > 0 then
+                local d = (root.Position - myRoot.Position).Magnitude
+                if d < bestDist then bestDist, best = d, pl end
+            end
+        end
+    end
+    return best
+end
+
+local function getCombatData()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local myHRP = char:FindFirstChild("HumanoidRootPart")
+    local arm = char:FindFirstChild("Right Arm") or char:FindFirstChild("RightHand")
+    if not myHRP or not arm then return nil end
+
+    local target = resolveTarget()
+    if not target or not target.Character then return nil end
+    local root = target.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+
+    local vel   = root.AssemblyLinearVelocity or Vector3.new(0,0,0)
+    local dist  = (root.Position - myHRP.Position).Magnitude
+    local ping  = getRealPing() / 1000
+    local travel = dist / S.BulletSpeed
+    local serverTick = 1/60
+
+    local speedBonus = math.clamp(vel.Magnitude / 20, 0, 0.05)
+    local jumpBonus  = 0
+    if vel.Y > 2 then jumpBonus = 0.02 end
+
+    local velLead = (vel.Magnitude / 100) * 0.05
+    if S.AdaptiveLead then
+        local pingFactor = (ping * 1000) / 50
+        velLead = velLead * pingFactor * S.PingCompensation
+    end
+
+    local basePred = S.PredictionPing / 1000
+    local totalLead = travel + ping + serverTick + speedBonus + jumpBonus + basePred + velLead
+    local targetPos = root.Position + (vel * totalLead)
+
+    local originPos
+    if S.ShootingMethod == "New (blatant)" then
+        originPos = root.Position + Vector3.new(0, 0.5, -0.6)
+        targetPos = targetPos + (vel * 0.02)
+    else
+        originPos = arm.Position
+        targetPos = targetPos + Vector3.new(0, dist/140, 0)
+    end
+    return root, originPos, targetPos, target
+end
+
+local function isWallBetween(originPos, targetPos, targetChar)
+    local myChar = LocalPlayer.Character
+    if not myChar then return false end
+    local myHead = myChar:FindFirstChild("Head")
+    if not myHead then return false end
+
+    local params = RaycastParams.new()
+    params.FilterDescendantsInstances = { myChar, targetChar, workspace.CurrentCamera }
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.IgnoreWater = true
+
+    local result = workspace:Raycast(myHead.Position, targetPos - myHead.Position, params)
+    if not result then return false end
+    local hitPart = result.Instance
+    if hitPart then
+        if hitPart.CanCollide == false or hitPart.Transparency >= 0.95 then return false end
+        local model = hitPart:FindFirstAncestorOfClass("Model")
+        if model and (Services.Players:GetPlayerFromCharacter(model) or model == targetChar) then
+            return false
+        end
+    end
+    return true
+end
+
+-- ============================================================
+-- HIT CHAMS ENGINE
+-- ============================================================
+local hitChamFolder = Instance.new("Folder")
+hitChamFolder.Name = "Sheriff_HitChams"
+hitChamFolder.Parent = workspace
+
+local function createHitChams(character, color, duration)
+    if not character then return end
+    local mat = Enum.Material.Neon
+    local trans = 0
+    local effect = "fade"
+
+    local model = Instance.new("Model")
+    model.Name = "hit_cham"
+
+    local function dress(part, srcPart)
+        part.CanCollide = false; part.CanTouch = false; part.CanQuery = false
+        part.Massless = true; part.Material = mat; part.Color = color; part.Transparency = trans
+        for _, d in ipairs(part:GetDescendants()) do
+            if d:IsA("JointInstance") or d:IsA("Constraint") or d:IsA("TouchTransmitter")
+                or d:IsA("Script") or d:IsA("LocalScript") then
+                d:Destroy()
+            end
+        end
+        part.Parent = model
+        part.CFrame = srcPart.CFrame
+        part.Anchored = true
+        local size = srcPart.Size
+        task.spawn(function()
+            local steps = 20
+            local delay = duration / steps
+            for i = 1, steps do
+                task.wait(delay)
+                if not (part and part.Parent) then return end
+                part.Transparency = trans + (1 - trans) * (i / steps)
+            end
+            if part and part.Parent then part:Destroy() end
+        end)
+    end
+
+    local whitelist = {
+        "Head","Torso","UpperTorso","LowerTorso",
+        "LeftArm","RightArm","LeftLeg","RightLeg",
+        "LeftUpperArm","LeftLowerArm","LeftHand",
+        "RightUpperArm","RightLowerArm","RightHand",
+        "LeftUpperLeg","LeftLowerLeg","LeftFoot",
+        "RightUpperLeg","RightLowerLeg","RightFoot",
+    }
+    local set = {}
+    for _, n in ipairs(whitelist) do set[n] = true end
+
+    for _, obj in ipairs(character:GetChildren()) do
+        if obj:IsA("BasePart") and set[obj.Name] then
+            local clone = Instance.new("Part")
+            clone.Size = obj.Size
+            clone.Shape = Enum.PartType.Block
+            dress(clone, obj)
+        end
+    end
+
+    model.Parent = hitChamFolder
+    task.delay(duration + 0.1, function() if model and model.Parent then model:Destroy() end end)
+end
+
+-- ============================================================
+-- HIT SOUND (BOOSTED)
+-- ============================================================
+local HitSoundGroup = Instance.new("SoundGroup")
+HitSoundGroup.Name = "Sheriff_HitSoundGroup"
+HitSoundGroup.Volume = 10
+HitSoundGroup.Parent = Services.SoundService
+
+local HitSound = Instance.new("Sound")
+HitSound.Name = "Sheriff_HitSound"
+HitSound.Volume = 5
+HitSound.RollOffMode = Enum.RollOffMode.Inverse
+HitSound.RollOffMinDistance = 5
+HitSound.RollOffMaxDistance = 500
+HitSound.SoundGroup = HitSoundGroup
+HitSound.Parent = Services.SoundService
+
+local HitSoundMasterGain = 1.75
+local HitSoundEnabled = true
+local HitSoundId = "https://files.catbox.moe/bgy8au.ogg"
+
+local function playHitSound()
+    if not HitSoundEnabled then return end
+    local id = tostring(HitSoundId or "")
+    if id == "" then return end
+    HitSound.Volume = 5 * (HitSoundMasterGain or 1)
+    if id:find("^http") then
+        task.spawn(function()
+            local folder = "NLAssets"
+            if not isfolder(folder) then makefolder(folder) end
+            local ext = id:match("%.%w+$") or ".ogg"
+            local fname = id:gsub("[^%w]", "")..ext
+            local path = folder.."/"..fname
+            if not isfile(path) then
+                local ok, body = pcall(function() return game:HttpGet(id) end)
+                if ok and body and not body:find("404") then writefile(path, body) end
+            end
+            if isfile(path) then
+                local asset = getcustomasset(path)
+                if asset then
+                    HitSound.SoundId = asset
+                    HitSound:Play()
+                end
+            end
+        end)
+    else
+        HitSound.SoundId = "rbxassetid://"..id:gsub("rbxassetid://", "")
+        HitSound:Play()
+    end
+end
+
+-- ============================================================
+-- HIT NOTIFICATION (kills / hits)
+-- ============================================================
+local notifGui = Instance.new("ScreenGui")
+notifGui.Name = "Sheriff_NotifGui"
+notifGui.ResetOnSpawn = false
+notifGui.IgnoreGuiInset = true
+pcall(function() notifGui.Parent = Services.CoreGui end)
+if not notifGui.Parent then notifGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+
+local notifFrame = Instance.new("Frame")
+notifFrame.Name = "Sheriff_NotifFrame"
+notifFrame.Size = UDim2.new(0, 400, 0, 160)
+notifFrame.Position = UDim2.new(0.5, -200, 0.62, 0)
+notifFrame.BackgroundTransparency = 1
+notifFrame.Parent = notifGui
+local notifLayout = Instance.new("UIListLayout", notifFrame)
+notifLayout.VerticalAlignment = Enum.VerticalAlignment.Bottom
+notifLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+notifLayout.SortOrder = Enum.SortOrder.LayoutOrder
+notifLayout.Padding = UDim.new(0, 5)
+
+local HitNotification = true
+
+local function customNotify(playerName, damage)
+    if not HitNotification then return end
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 0, 25)
+    label.BackgroundTransparency = 1
+    label.RichText = true
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 14
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.Text = string.format(
+        'hit <font color="rgb(160, 32, 240)">%s</font> for <font color="rgb(0, 255, 0)">%.1f</font> damage',
+        playerName, damage
+    )
+    local stroke = Instance.new("UIStroke", label)
+    stroke.Thickness = 1.5
+    stroke.Color = Color3.fromRGB(0, 0, 0)
+    label.Parent = notifFrame
+    task.spawn(function()
+        task.wait(2.5)
+        for i = 1, 10 do
+            task.wait(0.05)
+            local t = i / 10
+            label.TextTransparency = t
+            stroke.Transparency = t
+        end
+        label:Destroy()
+    end)
+end
+
+-- ============================================================
+-- SILENT AIM — the core action
+-- ============================================================
+local function fireSilentAim()
+    if not S.SilentAimEnabled then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    local gun = char:FindFirstChild("Gun") or (LocalPlayer.Backpack and LocalPlayer.Backpack:FindFirstChild("Gun"))
+    if not gun then return end
+    if gun.Parent ~= char then
+        char.Humanoid:EquipTool(gun)
+        task.wait(0.05)
+    end
+
+    local root, originPos, targetPos, targetPlayer = getCombatData()
+    if not root or not originPos or not targetPos or not targetPlayer then return end
+    if S.SilentAimWallCheck and isWallBetween(originPos, targetPos, root.Parent) then return end
+
+    local remote = gun:FindFirstChild("Shoot") or Services.ReplicatedStorage:FindFirstChild("ShootGun")
+    if remote then
+        pcall(function()
+            remote:FireServer(CFrame.lookAt(originPos, targetPos), CFrame.new(targetPos))
+        end)
+
+        S.SilentAimLastTarget = targetPlayer
+        S.SilentAimLastTargetTime = tick()
+        local expectedDamage = math.random(25, 85)
+
+        task.spawn(function()
+            task.wait(0.08)
+            local tc = targetPlayer.Character
+            if not tc then return end
+            local hum = tc:FindFirstChildOfClass("Humanoid")
+            if not hum then return end
+
+            local stillAlive = hum.Health > 0
+            local isKnocked = false
+            local be = tc:FindFirstChild("BodyEffects")
+            if be then
+                local ko = be:FindFirstChild("K.O") or be:FindFirstChild("KO")
+                if ko and ko.Value then isKnocked = true end
+            end
+
+            local prevHealth = S.SilentAimLastHealth
+            local curHealth = hum.Health
+            S.SilentAimLastHealth = curHealth
+
+            local hitRegistered = isKnocked or (prevHealth ~= nil and curHealth < prevHealth)
+            if not hitRegistered and stillAlive then return end
+
+            pcall(function() createHitChams(tc, DEFAULT_ACCENT, 2.5) end)
+            pcall(function() playHitSound() end)
+            pcall(function() customNotify(targetPlayer.DisplayName or targetPlayer.Name, expectedDamage) end)
+        end)
+
+        if S.SilentAimNotifier then
+            task.spawn(function()
+                task.wait(0.2)
+                local target = resolveTarget()
+                if target and target.Character then
+                    local hum = target.Character:FindFirstChildOfClass("Humanoid")
+                    if hum and hum.Health <= 0 then
+                        print("[Sheriff] Target dead:", target.Name)
+                    end
+                end
+            end)
+        end
+    end
+end
+
+local function grabGunAction()
+    local d = workspace:FindFirstChild("GunDrop", true)
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if d and hrp then
+        local old = hrp.CFrame
+        hrp.CFrame = d.CFrame
+        task.wait(0.05)
+        hrp.CFrame = old
+    end
+end
+
+-- ============================================================
+-- AUTO PREDICTION
+-- ============================================================
+local autoPredConn = nil
+local autoPredBetaConn = nil
+
+local function calculatePrediction(ping)
+    ping = math.clamp(tonumber(ping) or 50, 0, 400)
+    if ping <= 35 then return ping
+    elseif ping <= 50 then return ping + ((ping - 35) / 15) * 18
+    else return ping + (S.AutoPredBetaBuffer or 18) end
+end
+
+local function stopAutoPred()
+    if autoPredConn then autoPredConn:Disconnect(); autoPredConn = nil end
+end
+local function stopAutoPredBeta()
+    if autoPredBetaConn then autoPredBetaConn:Disconnect(); autoPredBetaConn = nil end
+end
+local function startAutoPred()
+    stopAutoPred()
+    autoPredConn = Services.RunService.Heartbeat:Connect(function()
+        S.PredictionPing = getRealPing()
+    end)
+end
+local function startAutoPredBeta()
+    stopAutoPredBeta()
+    autoPredBetaConn = Services.RunService.RenderStepped:Connect(function()
+        local ping = getRealPing()
+        local pred = math.floor(calculatePrediction(ping) + 0.5)
+        S.AutoPredBetaValue = pred
+        S.PredictionPing = pred
+    end)
+end
+
+-- ============================================================
+-- INPUT HOOKS
+-- ============================================================
+local inputConn = Services.UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    local key = input.KeyCode
+    if key == S.Keybinds.Shoot then
+        task.spawn(fireSilentAim)
+    elseif key == S.Keybinds.GrabGun then
+        task.spawn(grabGunAction)
+    end
+end)
+
+local autoGrabLoop = task.spawn(function()
+    while task.wait(0.1) do
+        if S.AutoGrabGun then
+            local drop = workspace:FindFirstChild("GunDrop", true)
+            local char = LocalPlayer.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            if drop and hrp then
+                pcall(function()
+                    firetouchinterest(hrp, drop, 0)
+                    firetouchinterest(hrp, drop, 1)
+                end)
+            end
+        end
+    end
+end)
+
+local roleLoop = task.spawn(function()
+    while task.wait(1.5) do fetchRoles() end
+end)
+
+-- ============================================================
+-- PUBLIC API
+-- ============================================================
+function API:EnableSilentAim(v) S.SilentAimEnabled = v end
+function API:IsSilentAimEnabled() return S.SilentAimEnabled end
+function API:SetShootingMethod(v) S.ShootingMethod = v end
+function API:SetWallCheck(v) S.SilentAimWallCheck = v end
+function API:EnableWallCheck(v) S.SilentAimWallCheck = v end
+function API:SetAutoGrabGun(v) S.AutoGrabGun = v end
+function API:EnableKillNotifier(v) S.SilentAimNotifier = v end
+function API:SetAdaptiveLead(v) S.AdaptiveLead = v end
+function API:SetPingCompensation(v) S.PingCompensation = v end
+function API:SetBulletSpeed(v) S.BulletSpeed = v end
+function API:SetPrediction(v)
+    if not S.AutoPredBeta then S.PredictionPing = v end
+end
+function API:EnableAutoPrediction(v)
+    S.AutoPrediction = v
+    if v then
+        S.AutoPredBeta = false
+        stopAutoPredBeta()
+        startAutoPred()
+    else
+        stopAutoPred()
+    end
+end
+function API:EnableAutoPredBeta(v)
+    S.AutoPredBeta = v
+    if v then
+        S.AutoPrediction = false
+        stopAutoPred()
+        startAutoPredBeta()
+    else
+        stopAutoPredBeta()
+    end
+end
+function API:SetAutoPredBetaPrediction(v)
+    if not S.AutoPredBeta then S.PredictionPing = v end
+end
+function API:SetShootKey(k) if k then S.Keybinds.Shoot = k end end
+function API:SetGrabGunKey(k) if k then S.Keybinds.GrabGun = k end end
+function API:SetHitSoundEnabled(v) HitSoundEnabled = v end
+function API:SetHitSoundId(v) HitSoundId = v end
+function API:SetHitSoundVolume(v)
+    HitSoundMasterGain = (v / 100) * 3.5
+    HitSound.Volume = 5 * HitSoundMasterGain
+end
+function API:SetHitNotificationEnabled(v) HitNotification = v end
+
+function API:Destroy()
+    if inputConn then inputConn:Disconnect() end
+    stopAutoPred()
+    stopAutoPredBeta()
+    task.cancel(autoGrabLoop)
+    task.cancel(roleLoop)
+    if hitChamFolder and hitChamFolder.Parent then hitChamFolder:Destroy() end
+    if notifGui and notifGui.Parent then notifGui:Destroy() end
+    if HitSound and HitSound.Parent then HitSound:Destroy() end
+    if HitSoundGroup and HitSoundGroup.Parent then HitSoundGroup:Destroy() end
+end
+
+return API
