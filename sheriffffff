@@ -1,0 +1,360 @@
+-- sheriff.lua — raw Sheriff Combat feature module (no UI, no toggles)
+-- Verbatim port of NeverLarp's Sheriff Combat stack:
+--   Silent Aim / shooting method / wall check / auto grab gun / kill notifier
+--   adaptive lead / ping compensation / bullet speed / prediction / auto pred / auto pred beta
+-- Consumer (AirFlow hub) wires the UI and calls the Set*/Enable*/Disable* methods.
+
+local API = {}
+
+local Services = {
+    Players           = game:GetService("Players"),
+    RunService        = game:GetService("RunService"),
+    UserInputService  = game:GetService("UserInputService"),
+    ReplicatedStorage = game:GetService("ReplicatedStorage"),
+    SoundService      = game:GetService("SoundService"),
+    TweenService      = game:GetService("TweenService"),
+    Lighting          = game:GetService("Lighting"),
+    Debris            = game:GetService("Debris"),
+    CoreGui           = game:GetService("CoreGui"),
+}
+local LocalPlayer = Services.Players.LocalPlayer
+local tick = tick or os.clock
+
+local DEFAULT_ACCENT = Color3.fromHex and Color3.fromHex("#9791df") or Color3.fromRGB(0x97, 0x91, 0xdf)
+
+local function getRealPing()
+    local ping = 50
+    pcall(function()
+        ping = Services.Players.LocalPlayer:GetNetworkPing() * 1000
+        if ping < 0 then ping = 0 end
+    end)
+    return math.floor(ping + 0.5)
+end
+
+-- ============================================================
+-- STATE
+-- ============================================================
+local S = {
+    SilentAimEnabled   = true,
+    SilentAimNotifier  = false,
+    SilentAimWallCheck = false,
+    ShootingMethod     = "New (blatant)",
+    AutoGrabGun        = false,
+    AdaptiveLead       = false,
+    PingCompensation   = 1.0,
+    BulletSpeed        = 2800,
+    PredictionPing     = 50,
+    AutoPrediction     = true,
+    AutoPredBeta       = false,
+    AutoPredBetaBuffer = 18,
+    AutoPredBetaValue  = 50,
+    Keybinds = {
+        Shoot   = Enum.KeyCode.E,
+        GrabGun = Enum.KeyCode.Y,
+        Throw   = Enum.KeyCode.U,
+    },
+    SilentAimLastTarget = nil,
+    SilentAimLastTargetTime = 0,
+    SilentAimLastHealth = nil,
+}
+
+local roleCache = {}
+
+local function fetchRoles()
+    local ok, data = pcall(function()
+        local remote = Services.ReplicatedStorage:FindFirstChild("GetPlayerData", true)
+        if remote then return remote:InvokeServer() end
+    end)
+    if ok and type(data) == "table" then
+        for k, v in pairs(data) do roleCache[k] = v end
+    end
+end
+
+local function getMurderer()
+    for _, pl in ipairs(Services.Players:GetPlayers()) do
+        if pl ~= LocalPlayer then
+            if (pl.Character and pl.Character:FindFirstChild("Knife"))
+                or (pl.Backpack and pl.Backpack:FindFirstChild("Knife")) then
+                return pl
+            end
+        end
+    end
+    for name, data in pairs(roleCache) do
+        if type(data) == "table" and data.Role == "Murderer" then
+            local pl = Services.Players:FindFirstChild(name)
+            if pl then return pl end
+        end
+    end
+    return nil
+end
+
+local function resolveTarget()
+    local murderer = getMurderer()
+    if murderer and murderer.Character and murderer.Character:FindFirstChild("HumanoidRootPart") then
+        return murderer
+    end
+    local best, bestDist = nil, math.huge
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return nil end
+    for _, pl in ipairs(Services.Players:GetPlayers()) do
+        if pl ~= LocalPlayer and pl.Character then
+            local root = pl.Character:FindFirstChild("HumanoidRootPart")
+            local hum = pl.Character:FindFirstChildOfClass("Humanoid")
+            if root and hum and hum.Health > 0 then
+                local d = (root.Position - myRoot.Position).Magnitude
+                if d < bestDist then bestDist, best = d, pl end
+            end
+        end
+    end
+    return best
+end
+
+local function getCombatData()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local myHRP = char:FindFirstChild("HumanoidRootPart")
+    local arm = char:FindFirstChild("Right Arm") or char:FindFirstChild("RightHand")
+    if not myHRP or not arm then return nil end
+
+    local target = resolveTarget()
+    if not target or not target.Character then return nil end
+    local root = target.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+
+    local vel   = root.AssemblyLinearVelocity or Vector3.new(0,0,0)
+    local dist  = (root.Position - myHRP.Position).Magnitude
+    local ping  = getRealPing() / 1000
+    local travel = dist / S.BulletSpeed
+    local serverTick = 1/60
+
+    local speedBonus = math.clamp(vel.Magnitude / 20, 0, 0.05)
+    local jumpBonus  = 0
+    if vel.Y > 2 then jumpBonus = 0.02 end
+
+    local velLead = (vel.Magnitude / 100) * 0.05
+    if S.AdaptiveLead then
+        local pingFactor = (ping * 1000) / 50
+        velLead = velLead * pingFactor * S.PingCompensation
+    end
+
+    local basePred = S.PredictionPing / 1000
+    local totalLead = travel + ping + serverTick + speedBonus + jumpBonus + basePred + velLead
+    local targetPos = root.Position + (vel * totalLead)
+
+    local originPos
+    if S.ShootingMethod == "New (blatant)" then
+        originPos = root.Position + Vector3.new(0, 0.5, -0.6)
+        targetPos = targetPos + (vel * 0.02)
+    else
+        originPos = arm.Position
+        targetPos = targetPos + Vector3.new(0, dist/140, 0)
+    end
+    return root, originPos, targetPos, target
+end
+
+local function isWallBetween(originPos, targetPos, targetChar)
+    local myChar = LocalPlayer.Character
+    if not myChar then return false end
+    local myHead = myChar:FindFirstChild("Head")
+    if not myHead then return false end
+
+    local params = RaycastParams.new()
+    params.FilterDescendantsInstances = { myChar, targetChar, workspace.CurrentCamera }
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.IgnoreWater = true
+
+    local result = workspace:Raycast(myHead.Position, targetPos - myHead.Position, params)
+    if not result then return false end
+    local hitPart = result.Instance
+    if hitPart then
+        if hitPart.CanCollide == false or hitPart.Transparency >= 0.95 then return false end
+        local model = hitPart:FindFirstAncestorOfClass("Model")
+        if model and (Services.Players:GetPlayerFromCharacter(model) or model == targetChar) then
+            return false
+        end
+    end
+    return true
+end
+
+-- ============================================================
+-- SILENT AIM — the core action
+-- ============================================================
+local function fireSilentAim()
+    if not S.SilentAimEnabled then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    local gun = char:FindFirstChild("Gun") or (LocalPlayer.Backpack and LocalPlayer.Backpack:FindFirstChild("Gun"))
+    if not gun then return end
+    if gun.Parent ~= char then
+        char.Humanoid:EquipTool(gun)
+        task.wait(0.05)
+    end
+
+    local root, originPos, targetPos, targetPlayer = getCombatData()
+    if not root or not originPos or not targetPos or not targetPlayer then return end
+    if S.SilentAimWallCheck and isWallBetween(originPos, targetPos, root.Parent) then return end
+
+    local remote = gun:FindFirstChild("Shoot") or Services.ReplicatedStorage:FindFirstChild("ShootGun")
+    if remote then
+        pcall(function()
+            remote:FireServer(CFrame.lookAt(originPos, targetPos), CFrame.new(targetPos))
+        end)
+        S.SilentAimLastTarget = targetPlayer
+        S.SilentAimLastTargetTime = tick()
+
+        if S.SilentAimNotifier then
+            task.spawn(function()
+                task.wait(0.2)
+                local target = resolveTarget()
+                if target and target.Character then
+                    local hum = target.Character:FindFirstChildOfClass("Humanoid")
+                    if hum and hum.Health <= 0 then
+                        print("[Sheriff] Target dead:", target.Name)
+                    end
+                end
+            end)
+        end
+    end
+end
+
+local function grabGunAction()
+    local d = workspace:FindFirstChild("GunDrop", true)
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if d and hrp then
+        local old = hrp.CFrame
+        hrp.CFrame = d.CFrame
+        task.wait(0.05)
+        hrp.CFrame = old
+    end
+end
+
+-- ============================================================
+-- AUTO PREDICTION
+-- ============================================================
+local autoPredConn = nil
+local autoPredBetaConn = nil
+
+local function calculatePrediction(ping)
+    ping = math.clamp(tonumber(ping) or 50, 0, 400)
+    if ping <= 35 then return ping
+    elseif ping <= 50 then return ping + ((ping - 35) / 15) * 18
+    else return ping + (S.AutoPredBetaBuffer or 18) end
+end
+
+local function stopAutoPred()
+    if autoPredConn then autoPredConn:Disconnect(); autoPredConn = nil end
+end
+local function stopAutoPredBeta()
+    if autoPredBetaConn then autoPredBetaConn:Disconnect(); autoPredBetaConn = nil end
+end
+local function startAutoPred()
+    stopAutoPred()
+    autoPredConn = Services.RunService.Heartbeat:Connect(function()
+        local ping = getRealPing()
+        S.PredictionPing = ping
+    end)
+end
+local function startAutoPredBeta()
+    stopAutoPredBeta()
+    autoPredBetaConn = Services.RunService.RenderStepped:Connect(function()
+        local ping = getRealPing()
+        local pred = math.floor(calculatePrediction(ping) + 0.5)
+        S.AutoPredBetaValue = pred
+        S.PredictionPing = pred
+    end)
+end
+
+-- ============================================================
+-- INPUT HOOKS
+-- ============================================================
+local inputConn = Services.UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    local key = input.KeyCode
+    if key == S.Keybinds.Shoot then
+        task.spawn(fireSilentAim)
+    elseif key == S.Keybinds.GrabGun then
+        task.spawn(grabGunAction)
+    end
+end)
+
+local autoGrabLoop = task.spawn(function()
+    while task.wait(0.1) do
+        if S.AutoGrabGun then
+            local drop = workspace:FindFirstChild("GunDrop", true)
+            local char = LocalPlayer.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            if drop and hrp then
+                pcall(function()
+                    firetouchinterest(hrp, drop, 0)
+                    firetouchinterest(hrp, drop, 1)
+                end)
+            end
+        end
+    end
+end)
+
+local roleLoop = task.spawn(function()
+    while task.wait(1.5) do fetchRoles() end
+end)
+
+-- ============================================================
+-- PUBLIC API
+-- ============================================================
+function API:EnableSilentAim(v) S.SilentAimEnabled = v end
+function API:IsSilentAimEnabled() return S.SilentAimEnabled end
+function API:SetShootingMethod(v) S.ShootingMethod = v end
+function API:SetWallCheck(v) S.SilentAimWallCheck = v end
+function API:SetAutoGrabGun(v) S.AutoGrabGun = v end
+function API:EnableKillNotifier(v) S.SilentAimNotifier = v end
+function API:SetAdaptiveLead(v) S.AdaptiveLead = v end
+function API:SetPingCompensation(v) S.PingCompensation = v end
+function API:SetBulletSpeed(v) S.BulletSpeed = v end
+function API:SetPrediction(v)
+    if not S.AutoPredBeta then S.PredictionPing = v end
+end
+function API:GetPrediction()
+    return S.PredictionPing
+end
+function API:IsAutoPredictionOn()
+    return S.AutoPrediction
+end
+function API:IsAutoPredBetaOn()
+    return S.AutoPredBeta
+end
+function API:EnableAutoPrediction(v)
+    S.AutoPrediction = v
+    if v then
+        S.AutoPredBeta = false
+        stopAutoPredBeta()
+        startAutoPred()
+    else
+        stopAutoPred()
+    end
+end
+function API:EnableAutoPredBeta(v)
+    S.AutoPredBeta = v
+    if v then
+        S.AutoPrediction = false
+        stopAutoPred()
+        startAutoPredBeta()
+    else
+        stopAutoPredBeta()
+    end
+end
+function API:SetAutoPredBetaPrediction(v)
+    if not S.AutoPredBeta then S.PredictionPing = v end
+end
+function API:SetShootKey(k) if k then S.Keybinds.Shoot = k end end
+function API:SetGrabGunKey(k) if k then S.Keybinds.GrabGun = k end end
+
+function API:Destroy()
+    if inputConn then inputConn:Disconnect() end
+    stopAutoPred()
+    stopAutoPredBeta()
+    task.cancel(autoGrabLoop)
+    task.cancel(roleLoop)
+end
+
+return API
