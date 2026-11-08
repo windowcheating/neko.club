@@ -1,0 +1,586 @@
+--// AirFlow Library — Full Example Hub
+--// ESP + visuals modules load from windowcheating/neko.club
+
+local Library = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/kni-fe/free-products/main/AirFlowLibrary.luau"
+))()
+
+getgenv().Library = Library
+
+--////////////////////////////////////////////////////////////////
+--// 1. WINDOW SETUP
+--////////////////////////////////////////////////////////////////
+local Window = Library:Window({
+    Title = "neko.cafe",
+    Version = "beta v1.0",
+    Icon = "code",             
+    Size = UDim2.fromOffset(760, 520),
+    Keybind = "RightControl",       
+    
+    DefaultTheme = "Rose",
+    Backdrop = { Weather = "Sakura", Tint = 0.75 },
+    IslandStyle = "Show on Hover",  
+    ToggleButton = false, 
+    
+    Loading = {
+        Enabled = true,
+        Duration = 5.6,
+        Title = "neko.cafe",
+        Subtitle = "Loading Modules...",
+        Steps = { "Preparing Interface", "Downloading Modules", "Successfully Loading" },
+    },
+    Home = {
+        Name = "Interface",
+        Icon = "activity",
+        Welcome = "Welcome back",
+        Tier = "Private",
+        Discord = "discord.gg/example",
+        Website = "example.com",
+        Stats = { "Players", "Execs", "Session", "FPS", "Ping" },
+        Features = true, 
+    },
+    Profile = true, 
+    Search = true,  
+})
+
+--////////////////////////////////////////////////////////////////
+--// FORCE KEYBIND TO MINIMIZE (SHOW WATERMARK)
+--////////////////////////////////////////////////////////////////
+task.spawn(function()
+    task.wait(1) 
+    Window.Keybind = nil 
+    
+    game:GetService("UserInputService").InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed then return end
+        if input.KeyCode == Enum.KeyCode.RightControl then
+            task.defer(function()
+                if Window.Minimized then
+                    Window:Restore()
+                elseif Window.Open then
+                    Window:Minimize() 
+                end
+            end)
+        end
+    end)
+end)
+
+--////////////////////////////////////////////////////////////////
+--// DECORATOR ENGINE
+--////////////////////////////////////////////////////////////////
+local decorator = nil
+local decoratorVisible = true
+
+local cachedAssets = {}
+local decorOptions = {
+    ["waifu"] = { url = "https://files.catbox.moe/z7zvgv.png", size = UDim2.fromOffset(180, 120), position = UDim2.new(1, -10, 0, 18) },
+    ["mei mei"] = { url = "https://files.catbox.moe/sysmjw.png", size = UDim2.fromOffset(130, 130), position = UDim2.new(1, -25, 0, -2) }
+}
+
+local function downloadAsset(name)
+    local opt = decorOptions[name]; if not opt then return end
+    if type(writefile) == "function" and type(isfile) == "function" and type(getcustomasset) == "function" then
+        local folder = "AirFlowDecorator"
+        if type(isfolder) == "function" and type(makefolder) == "function" and not isfolder(folder) then makefolder(folder) end
+        local fileName = (name == "waifu" and "customgirl2.png" or "meimei.png")
+        local path = folder .. "/" .. fileName
+        if not isfile(path) then
+            local ok, body = pcall(function() return game:HttpGet(opt.url) end)
+            if ok and body then writefile(path, body) end
+        end
+        if isfile(path) then cachedAssets[name] = getcustomasset(path) end
+    else
+        cachedAssets[name] = opt.url
+    end
+end
+
+task.spawn(function() downloadAsset("waifu"); downloadAsset("mei mei") end)
+
+local function setDecorator(name)
+    local opt = decorOptions[name]; if not opt or not decorator then return end
+    decorator.Size = opt.size
+    decorator.Position = opt.position
+    decorator.Image = cachedAssets[name] or opt.url
+end
+
+task.spawn(function()
+    task.wait(1.5) 
+    decorator = Instance.new("ImageLabel")
+    decorator.Name = "TopLogoDecorator"
+    decorator.BackgroundTransparency = 1
+    decorator.ZIndex = 50
+    decorator.AnchorPoint = Vector2.new(1, 1)
+    decorator.ImageTransparency = 1
+    decorator.Visible = true 
+    Window.Body.ClipsDescendants = false
+    decorator.Parent = Window.Body
+    setDecorator("waifu")
+
+    task.spawn(function()
+        local RunService = game:GetService("RunService")
+        local lastAlpha = -1
+        RunService.RenderStepped:Connect(function()
+            if not decorator or not Window.Body then return end
+            local currentAlpha = Window._bodyAlpha or 0
+            local isHidden = not Window.Open or Window.Minimized
+            if currentAlpha ~= lastAlpha or isHidden ~= (decorator.ImageTransparency == 1) then
+                lastAlpha = currentAlpha
+                decorator.ImageTransparency = (decoratorVisible and not isHidden) and currentAlpha or 1
+            end
+        end)
+    end)
+end)
+
+--////////////////////////////////////////////////////////////////
+--// KEYBIND HUD
+--////////////////////////////////////////////////////////////////
+local kbGui = Instance.new("ScreenGui")
+kbGui.Name = "AirFlow_KeybindHUD"
+kbGui.ResetOnSpawn = false
+kbGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+kbGui.Enabled = false 
+kbGui.Parent = game:GetService("CoreGui")
+
+local mainCard = Instance.new("Frame")
+mainCard.Name = "KeybindsCard"
+mainCard.Size = UDim2.new(0, 180, 0, 28)
+mainCard.Position = UDim2.new(0.04, 0, 0.45, 0)
+mainCard.BackgroundColor3 = Color3.fromRGB(22, 15, 18) 
+mainCard.BackgroundTransparency = 0.05
+mainCard.BorderSizePixel = 0
+mainCard.ClipsDescendants = true
+mainCard.Parent = kbGui
+
+local c1 = Instance.new("UICorner", mainCard); c1.CornerRadius = UDim.new(0, 7)
+local s1 = Instance.new("UIStroke", mainCard)
+s1.Color = Color3.fromRGB(22, 15, 18); s1.Thickness = 1; s1.Transparency = 1 
+
+local headerBar = Instance.new("Frame", mainCard)
+headerBar.Size = UDim2.new(1, 0, 0, 27); headerBar.BackgroundTransparency = 1
+
+local title = Instance.new("TextLabel", headerBar)
+title.Size = UDim2.new(1, -20, 1, 0); title.Position = UDim2.new(0, 10, 0, 0)
+title.BackgroundTransparency = 1; title.Text = "keybinds"
+title.TextColor3 = Color3.fromRGB(240, 228, 232); title.TextSize = 11
+title.Font = Enum.Font.GothamBold; title.TextXAlignment = Enum.TextXAlignment.Left
+
+local sep = Instance.new("Frame", mainCard)
+sep.Size = UDim2.new(1, -16, 0, 1); sep.Position = UDim2.new(0, 8, 0, 27)
+sep.BackgroundColor3 = Color3.fromRGB(246, 160, 186); sep.BackgroundTransparency = 0.85
+sep.BorderSizePixel = 0
+
+local rowsHolder = Instance.new("Frame", mainCard)
+rowsHolder.Name = "RowsHolder"
+rowsHolder.Size = UDim2.new(1, 0, 1, -29); rowsHolder.Position = UDim2.new(0, 0, 0, 29)
+rowsHolder.BackgroundTransparency = 1
+
+local pad = Instance.new("UIPadding", rowsHolder)
+pad.PaddingLeft = UDim.new(0, 10); pad.PaddingRight = UDim.new(0, 10)
+pad.PaddingTop = UDim.new(0, 5);   pad.PaddingBottom = UDim.new(0, 5)
+
+local layout = Instance.new("UIListLayout", rowsHolder)
+layout.Padding = UDim.new(0, 3); layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local dragging, dragStart, startPos, dragInput
+headerBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true; dragStart = input.Position; startPos = mainCard.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end)
+headerBar.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+game:GetService("UserInputService").InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        local delta = input.Position - dragStart
+        mainCard.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+
+local TrackedKeybinds = {}
+
+--////////////////////////////////////////////////////////////////
+--// 2. TABS
+--////////////////////////////////////////////////////////////////
+local MainTab     = Window:Tab({ Name = "Main",     Icon = "house",    Desc = "Core features" })
+local PlayerTab   = Window:Tab({ Name = "Player",   Icon = "user" })
+local SettingsTab = Window:Tab({ Name = "Settings", Icon = "settings" })
+local VisualTab   = Window:Tab({ Name = "Visuals",  Icon = "eye" })
+
+--////////////////////////////////////////////////////////////////
+--// 3. SUB TABS
+--////////////////////////////////////////////////////////////////
+local CombatSub   = MainTab:SubTab({ Name = "Combat",   Icon = "sword" })
+local ResourceSub = MainTab:SubTab({ Name = "Resource", Icon = "gem" })
+local MiscSub     = MainTab:SubTab({ Name = "Misc",     Icon = "wrench" })
+
+--////////////////////////////////////////////////////////////////
+--// 4. GROUPBOXES
+--////////////////////////////////////////////////////////////////
+local PlayerGroup = PlayerTab:Groupbox({ Name = "Player Stats", Icon = "user", Side = "Left" })
+local UtilGroup   = PlayerTab:Groupbox({ Name = "Utilities",   Icon = "wrench", Side = "Right" })
+
+--////////////////////////////////////////////////////////////////
+--// 5. MAIN / COMBAT
+--////////////////////////////////////////////////////////////////
+CombatSub:Section("Aim")
+
+local AimbotEnabled = false
+local AimbotKey = Enum.KeyCode.F
+table.insert(TrackedKeybinds, {
+    Name = "Aimbot",
+    GetKey = function() return AimbotKey.Name end,
+    IsActive = function() return AimbotEnabled end
+})
+
+CombatSub:Toggle({
+    Name = "Aimbot", Flag = "Aimbot", Default = false,
+    Callback = function(value) AimbotEnabled = value end,
+})
+
+CombatSub:Dropdown({
+    Name = "Aim Part", Flag = "AimPart",
+    Options = { "Head", "Torso", "Random" }, Default = "Head",
+    AllowNone = false,
+    Callback = function(v) print("[AimPart]", v) end,
+})
+
+CombatSub:Divider()
+
+--////////////////////////////////////////////////////////////////
+--// 6. MAIN / RESOURCE
+--////////////////////////////////////////////////////////////////
+ResourceSub:Section("Farming")
+
+local AutoFarmEnabled = false
+table.insert(TrackedKeybinds, {
+    Name = "Auto Farm",
+    GetKey = function() return "Toggle" end,
+    IsActive = function() return AutoFarmEnabled end
+})
+
+ResourceSub:Toggle({ Name = "Auto Farm", Flag = "AutoFarm", Default = false, Callback = function(v) AutoFarmEnabled = v end })
+ResourceSub:Slider({ Name = "Farm Speed", Flag = "FarmSpeed", Min = 1, Max = 10, Step = 1, Default = 3, Suffix = "x",
+    Callback = function(v) print("[FarmSpeed]", v) end, OnRelease = function(v) print("[FarmSpeed released]", v) end })
+ResourceSub:Dropdown({ Name = "Farm Mode", Flag = "FarmMode", Options = { "Legit", "Blatant", "Silent" }, Default = "Legit", AllowNone = false,
+    Callback = function(v) print("[FarmMode]", v) end })
+ResourceSub:Input({ Name = "Farm Amount", Flag = "FarmAmount", Numeric = true, Placeholder = "1000", Callback = function(n) print("[FarmAmount]", n) end })
+ResourceSub:Input({ Name = "Kill Message", Flag = "KillMsg", Placeholder = "Type a message...", Default = "gg", Callback = function(t) print("[KillMsg]", t) end })
+
+--////////////////////////////////////////////////////////////////
+--// 7. MAIN / MISC
+--////////////////////////////////////////////////////////////////
+MiscSub:Section("Actions")
+
+MiscSub:Button({ Name = "Rejoin Server", Desc = "Teleport back to this server", Icon = "refresh-cw", Style = "Primary", Callback = function() Window:Rejoin() end })
+MiscSub:Button({ Name = "Server Hop", Desc = "Jump to a random server", Icon = "shuffle", Callback = function() Window:ServerHop() end })
+MiscSub:ButtonRow({
+    { Name = "Lowest Server", Callback = function() Window:JoinLowestServer() end },
+    { Name = "Copy Job ID",   Callback = function() Window:CopyToClipboard(game.JobId, "Job ID") end },
+})
+
+local PanicKey = Enum.KeyCode.F
+table.insert(TrackedKeybinds, {
+    Name = "Panic Key",
+    GetKey = function() return PanicKey.Name end,
+    IsActive = function() return Window.Open end
+})
+
+MiscSub:Keybind({ Name = "Panic Key", Flag = "PanicKey", Default = "F", Callback = function(key) print("[Panic]", key.Name) end,
+    OnChanged = function(key) if key then PanicKey = key end end })
+MiscSub:Stepper({ Name = "Teleport Distance", Icon = "chevrons-up-down", Min = 1, Max = 100, Step = 1, Default = 10, Suffix = "m",
+    Callback = function(v) print("[Stepper]", v) end })
+
+local Progress = MiscSub:Progress({ Name = "Loading", Default = 0, Callback = function(v) end })
+Progress:Set(0.35)
+
+--////////////////////////////////////////////////////////////////
+--// 8. PLAYER GROUPBOXES
+--////////////////////////////////////////////////////////////////
+PlayerGroup:Toggle({ Name = "God Mode", Flag = "GodMode", Callback = function(v) print("[GodMode]", v) end })
+PlayerGroup:Slider({ Name = "Walk Speed", Flag = "WalkSpeed", Min = 16, Max = 300, Step = 1, Default = 16, Suffix = " studs",
+    Callback = function(v)
+        local char = game.Players.LocalPlayer.Character
+        if char and char:FindFirstChildOfClass("Humanoid") then char:FindFirstChildOfClass("Humanoid").WalkSpeed = v end
+    end })
+PlayerGroup:Slider({ Name = "Jump Power", Flag = "JumpPower", Min = 50, Max = 500, Step = 1, Default = 50,
+    Callback = function(v)
+        local char = game.Players.LocalPlayer.Character
+        if char and char:FindFirstChildOfClass("Humanoid") then char:FindFirstChildOfClass("Humanoid").JumpPower = v end
+    end })
+
+UtilGroup:Dropdown({ Name = "Whitelist", Flag = "Whitelist", Options = { "Player1", "Player2", "Player3" }, Multi = true, Default = { "Player1" },
+    Callback = function(values) print("[Whitelist]", table.concat(values, ", ")) end })
+UtilGroup:Button({ Name = "Refresh Whitelist", Callback = function()
+    local names = {}
+    for _, p in ipairs(game.Players:GetPlayers()) do
+        if p ~= game.Players.LocalPlayer then table.insert(names, p.Name) end
+    end
+    UtilGroup:Dropdown({ Name = "Whitelist", Flag = "Whitelist", Options = names, Multi = true })
+end })
+
+--////////////////////////////////////////////////////////////////
+--// 9. LABELS & STATUS
+--////////////////////////////////////////////////////////////////
+MainTab:Label({ Text = "Welcome to the script!" })
+MainTab:Label({ Text = "FPS: --", Update = function() return "FPS: " .. math.floor(workspace:GetRealPhysicsFPS()) end, UpdateRate = 1 })
+
+local StatusBadge = MainTab:Status({ Name = "Status", Value = "Idle", Style = "Badge", Tone = "Success" })
+StatusBadge:Set("Running")
+MainTab:Status({ Name = "Players", Style = "Plain", Update = function() return #game.Players:GetPlayers() .. "/" .. game.Players.MaxPlayers end, UpdateRate = 2 })
+local EventLog = MainTab:StatusList({ Name = "Recent Events", MaxRows = 6 })
+EventLog:Set({ { Text = "Player joined", Value = "Alice", Tone = "Success" }, { Text = "Player left", Value = "Bob", Tone = "Error" } })
+
+--////////////////////////////////////////////////////////////////
+--// 10. TABLE
+--////////////////////////////////////////////////////////////////
+local Leaderboard = MainTab:Table({
+    Name = "Leaderboard",
+    Columns = {
+        { Name = "Player", Width = 0.5 },
+        { Name = "Kills",  Width = 0.25, Sortable = true },
+        { Name = "Deaths", Width = 0.25, Sortable = true },
+    },
+    Rows = { { "Alice", 42, 3 }, { "Bob", 17, 12 } },
+    Search = true, MaxRows = 8,
+})
+Leaderboard:AddRow({ "Charlie", 5, 5 })
+Leaderboard:Sort("Kills", true)
+
+--////////////////////////////////////////////////////////////////
+--// 11. VISUALS TAB
+--////////////////////////////////////////////////////////////////
+local ESPVisualGroup   = VisualTab:Groupbox({ Name = "ESP Settings",    Icon = "eye",       Side = "Left" })
+local SelfMatGroup     = VisualTab:Groupbox({ Name = "Self Material",  Icon = "user",      Side = "Left" })
+local PartAuraGroup    = VisualTab:Groupbox({ Name = "Particle Aura",  Icon = "sparkles",  Side = "Left" })
+local CursorPetGroup   = VisualTab:Groupbox({ Name = "Cursor Pet",     Icon = "cat",       Side = "Left" })
+local ToolMatGroup     = VisualTab:Groupbox({ Name = "Tool Material",  Icon = "hammer",    Side = "Right" })
+local ToolAuraGroup    = VisualTab:Groupbox({ Name = "Tool Aura",      Icon = "wand",      Side = "Right" })
+local CharizardGroup   = VisualTab:Groupbox({ Name = "Charizard Cursor", Icon = "fire",    Side = "Right" })
+local CrosshairGroup   = VisualTab:Groupbox({ Name = "Crosshair",      Icon = "crosshairs", Side = "Right" })
+local PreviewGroup     = VisualTab:Groupbox({ Name = "Preview",        Icon = "box",       Side = "Right" })
+
+-- ESP module
+local ESP_URL = "https://raw.githubusercontent.com/windowcheating/neko.club/refs/heads/main/espppp"
+local ESP = (function()
+    local ok, src = pcall(game.HttpGet, game, ESP_URL)
+    if not ok or not src or #src < 20 then warn("[ESP] Failed: "..tostring(ok and "empty" or src)); return nil end
+    local fn, err = loadstring(src)
+    if not fn then warn("[ESP] Compile: "..tostring(err)); return nil end
+    local ok2, result = pcall(fn)
+    if not ok2 then warn("[ESP] Runtime: "..tostring(result)); return nil end
+    if type(result) ~= "table" then warn("[ESP] Not a table: "..type(result)); return nil end
+    print("[ESP] Loaded from "..ESP_URL)
+    return result
+end)()
+
+-- Visuals module
+local VISUALS_URL = "https://raw.githubusercontent.com/windowcheating/neko.club/refs/heads/main/visuals.lua"
+local VisualsAPI = (function()
+    local ok, src = pcall(game.HttpGet, game, VISUALS_URL)
+    if not ok or not src or #src < 20 then warn("[Visuals] Failed: "..tostring(ok and "empty" or src)); return nil end
+    local fn, err = loadstring(src)
+    if not fn then warn("[Visuals] Compile: "..tostring(err)); return nil end
+    local ok2, result = pcall(fn)
+    if not ok2 then warn("[Visuals] Runtime: "..tostring(result)); return nil end
+    if type(result) ~= "table" then warn("[Visuals] Not a table: "..type(result)); return nil end
+    print("[Visuals] Loaded from "..VISUALS_URL)
+    return result
+end)()
+
+local function safeCall(mod, method, label)
+    if not mod then warn("["..label.."] module not loaded"); return end
+    local ok, err = pcall(function() mod[method](mod) end)
+    if not ok then warn("["..label.."] "..method..": "..tostring(err)) end
+end
+local function safeSet(mod, method, val, label)
+    if not mod then return end
+    pcall(function() mod[method](mod, val) end)
+end
+
+-- ESP toggles
+ESPVisualGroup:Toggle({ Name = "Highlight",        Default = false, Callback = function(v) safeCall(ESP, v and "EnableHighlight" or "DisableHighlight", "Highlight") end })
+ESPVisualGroup:Toggle({ Name = "Dropped Gun ESP",  Default = false, Callback = function(v) safeCall(ESP, v and "EnableGunESP"    or "DisableGunESP",    "GunESP")    end })
+ESPVisualGroup:Toggle({ Name = "Trap ESP",         Default = false, Callback = function(v) safeCall(ESP, v and "EnableTrapESP"   or "DisableTrapESP",   "TrapESP")   end })
+ESPVisualGroup:Toggle({ Name = "Footstep Trails",  Default = false, Callback = function(v) safeCall(ESP, v and "EnableFootsteps" or "DisableFootsteps", "Footsteps") end })
+
+-- Self Material
+SelfMatGroup:Toggle({ Name = "Enabled", Default = false,
+    Callback = function(v) safeCall(VisualsAPI, v and "EnableSelfMaterial" or "DisableSelfMaterial", "SelfMat") end })
+SelfMatGroup:Dropdown({ Name = "Material", Options = { "ForceField", "Neon", "Glass", "Wireframe", "SmoothPlastic" }, Default = "Neon", AllowNone = false,
+    Callback = function(v) safeSet(VisualsAPI, "SetSelfMaterialMaterial", v, "SelfMat") end })
+SelfMatGroup:ColorPicker({ Name = "Color", Default = Color3.fromHex("#9791df"),
+    Callback = function(c) safeSet(VisualsAPI, "SetSelfMaterialColor", c, "SelfMat") end })
+SelfMatGroup:Slider({ Name = "Transparency", Min = 0, Max = 0.95, Step = 0.05, Default = 0,
+    Callback = function(v) safeSet(VisualsAPI, "SetSelfMaterialTransparency", v, "SelfMat") end })
+
+-- Tool Material
+ToolMatGroup:Toggle({ Name = "Enabled", Default = false,
+    Callback = function(v) safeCall(VisualsAPI, v and "EnableToolMaterial" or "DisableToolMaterial", "ToolMat") end })
+ToolMatGroup:Dropdown({ Name = "Material", Options = { "Neon", "ForceField" }, Default = "Neon", AllowNone = false,
+    Callback = function(v) safeSet(VisualsAPI, "SetToolMaterialMaterial", v, "ToolMat") end })
+ToolMatGroup:ColorPicker({ Name = "Color", Default = Color3.fromHex("#9791df"),
+    Callback = function(c) safeSet(VisualsAPI, "SetToolMaterialColor", c, "ToolMat") end })
+ToolMatGroup:Slider({ Name = "Transparency", Min = 0, Max = 0.95, Step = 0.05, Default = 0,
+    Callback = function(v) safeSet(VisualsAPI, "SetToolMaterialTransparency", v, "ToolMat") end })
+
+-- Particle Aura
+PartAuraGroup:Toggle({ Name = "Enabled", Default = false,
+    Callback = function(v) safeCall(VisualsAPI, v and "EnableParticleAura" or "DisableParticleAura", "PartAura") end })
+PartAuraGroup:Dropdown({ Name = "Aura", Options = { "starlight","heavenly","ribbon","sakura","angel","wind","flow","star" }, Default = "angel", AllowNone = false,
+    Callback = function(v) safeSet(VisualsAPI, "SetParticleAuraType", v, "PartAura") end })
+PartAuraGroup:ColorPicker({ Name = "Color", Default = Color3.fromHex("#9791df"),
+    Callback = function(c) safeSet(VisualsAPI, "SetParticleAuraColor", c, "PartAura") end })
+
+-- Tool Aura
+ToolAuraGroup:Toggle({ Name = "Enabled", Default = false,
+    Callback = function(v) safeCall(VisualsAPI, v and "EnableToolAura" or "DisableToolAura", "ToolAura") end })
+ToolAuraGroup:ColorPicker({ Name = "Color", Default = Color3.fromHex("#9791df"),
+    Callback = function(c) safeSet(VisualsAPI, "SetToolAuraColor", c, "ToolAura") end })
+ToolAuraGroup:Slider({ Name = "Rate Multiplier", Min = 0.1, Max = 5, Step = 0.1, Default = 0.1,
+    Callback = function(v) safeSet(VisualsAPI, "SetToolAuraRate", v, "ToolAura") end })
+
+-- Cursor Pet
+CursorPetGroup:Toggle({ Name = "Enabled", Default = false,
+    Callback = function(v) safeCall(VisualsAPI, v and "EnableCursorPet" or "DisableCursorPet", "CursorPet") end })
+CursorPetGroup:ColorPicker({ Name = "Color", Default = Color3.fromHex("#9791df"),
+    Callback = function(c) safeSet(VisualsAPI, "SetCursorPetColor", c, "CursorPet") end })
+CursorPetGroup:Toggle({ Name = "Follow Target", Default = true,
+    Callback = function(v) safeSet(VisualsAPI, "SetCursorPetFollowTarget", v, "CursorPet") end })
+CursorPetGroup:Slider({ Name = "Speed", Min = 50, Max = 350, Step = 1, Default = 110,
+    Callback = function(v) safeSet(VisualsAPI, "SetCursorPetSpeed", v, "CursorPet") end })
+CursorPetGroup:Slider({ Name = "Follow Distance", Min = 10, Max = 150, Step = 1, Default = 45,
+    Callback = function(v) safeSet(VisualsAPI, "SetCursorPetDistance", v, "CursorPet") end })
+
+-- Charizard Cursor
+CharizardGroup:Toggle({ Name = "Enabled", Default = false,
+    Callback = function(v) safeCall(VisualsAPI, v and "EnableCharizardCursor" or "DisableCharizardCursor", "Charizard") end })
+CharizardGroup:ColorPicker({ Name = "Color", Default = Color3.fromHex("#9791df"),
+    Callback = function(c) safeSet(VisualsAPI, "SetCharizardColor", c, "Charizard") end })
+CharizardGroup:Dropdown({ Name = "Position", Options = { "Mouse", "Above Tool", "Follow Target", "Shoulder" }, Default = "Mouse", AllowNone = false,
+    Callback = function(v) safeSet(VisualsAPI, "SetCharizardMode", v, "Charizard") end })
+
+-- Crosshair
+CrosshairGroup:Toggle({ Name = "Enabled", Default = false,
+    Callback = function(v) safeCall(VisualsAPI, v and "EnableCrosshair" or "DisableCrosshair", "Crosshair") end })
+CrosshairGroup:Dropdown({ Name = "Position", Options = { "mouse", "gun tip", "target" }, Default = "mouse", AllowNone = false,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairPosition", v, "Crosshair") end })
+CrosshairGroup:ColorPicker({ Name = "Color", Default = Color3.fromHex("#9791df"),
+    Callback = function(c) safeSet(VisualsAPI, "SetCrosshairColor", c, "Crosshair") end })
+CrosshairGroup:Slider({ Name = "Lines", Min = 2, Max = 8, Step = 1, Default = 4,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairLines", v, "Crosshair") end })
+CrosshairGroup:Slider({ Name = "Radius", Min = 2, Max = 50, Step = 1, Default = 14,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairRadius", v, "Crosshair") end })
+CrosshairGroup:Slider({ Name = "Length", Min = 2, Max = 40, Step = 1, Default = 9,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairLength", v, "Crosshair") end })
+CrosshairGroup:Slider({ Name = "Thickness", Min = 1, Max = 5, Step = 1, Default = 2,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairThickness", v, "Crosshair") end })
+CrosshairGroup:Slider({ Name = "Rotation", Min = 0, Max = 360, Step = 1, Default = 0,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairRotation", v, "Crosshair") end })
+CrosshairGroup:Toggle({ Name = "Spin", Default = true,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairSpin", v, "Crosshair") end })
+CrosshairGroup:Slider({ Name = "Spin Speed", Min = 10, Max = 720, Step = 10, Default = 120,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairSpinSpeed", v, "Crosshair") end })
+CrosshairGroup:Toggle({ Name = "Pulse", Default = true,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairPulse", v, "Crosshair") end })
+CrosshairGroup:Slider({ Name = "Gap Pulse", Min = 0, Max = 25, Step = 1, Default = 5,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairGapPulse", v, "Crosshair") end })
+CrosshairGroup:Slider({ Name = "Size Pulse", Min = 0, Max = 25, Step = 1, Default = 6,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairSizePulse", v, "Crosshair") end })
+CrosshairGroup:Toggle({ Name = "Hide Game Crosshair", Default = false,
+    Callback = function(v) safeSet(VisualsAPI, "SetCrosshairHideGame", v, "Crosshair") end })
+
+-- Preview
+local Preview = PreviewGroup:Viewport({ Name = "Character Preview", Model = game.Players.LocalPlayer, Height = 260, Spin = true })
+local vpf = Preview.Media or Preview._frame or Preview.Frame
+if vpf and not vpf:IsA("ViewportFrame") then vpf = vpf:FindFirstChildWhichIsA("ViewportFrame") or vpf end
+local previewOverlay = Instance.new("Frame")
+previewOverlay.Size = UDim2.new(1,0,1,0)
+previewOverlay.BackgroundTransparency = 1
+previewOverlay.ZIndex = 10
+previewOverlay.Parent = vpf
+
+--////////////////////////////////////////////////////////////////
+--// 12. COMBINED SETTINGS TAB
+--////////////////////////////////////////////////////////////////
+local ConfigGroup = SettingsTab:Groupbox({ Name = "Configs", Icon = "folder", Side = "Left" })
+local ThemeGroup  = SettingsTab:Groupbox({ Name = "Themes",  Icon = "palette", Side = "Right" })
+
+ConfigGroup:ConfigManager({ FolderName = "neko.cafe" })
+
+ThemeGroup:Toggle({ Name = "Show Keybind List", Default = true,
+    Callback = function(v)
+        if Window._introDone then kbGui.Enabled = v
+        else task.spawn(function() while not Window._introDone do task.wait(0.1) end; kbGui.Enabled = v end) end
+    end })
+ThemeGroup:Toggle({ Name = "Show Decorator", Default = true,
+    Callback = function(v)
+        decoratorVisible = v
+        if decorator then
+            if v and Window.Open and not Window.Minimized then decorator.ImageTransparency = Window._bodyAlpha or 0
+            elseif not v then decorator.ImageTransparency = 1 end
+        end
+    end })
+ThemeGroup:Dropdown({ Name = "Decorator Image", Options = { "waifu", "mei mei" }, Default = "waifu", AllowNone = false,
+    Callback = function(v) setDecorator(v) end })
+ThemeGroup:ThemeManager()
+
+task.spawn(function() while not Window._introDone do task.wait(0.1) end; task.wait(0.5); kbGui.Enabled = true end)
+
+--////////////////////////////////////////////////////////////////
+--// KEYBIND HUD RENDERER
+--////////////////////////////////////////////////////////////////
+local KB_RowInstances = {}
+
+for _, feature in ipairs(TrackedKeybinds) do
+    local row = Instance.new("Frame", rowsHolder)
+    row.Size = UDim2.new(1, 0, 0, 16); row.BackgroundTransparency = 1; row.Visible = false
+    local name = Instance.new("TextLabel", row)
+    name.Size = UDim2.new(0.65, 0, 1, 0); name.BackgroundTransparency = 1
+    name.Text = feature.Name; name.Font = Enum.Font.GothamMedium; name.TextSize = 11
+    name.TextColor3 = Color3.fromRGB(240, 228, 232); name.TextXAlignment = Enum.TextXAlignment.Left
+    local status = Instance.new("TextLabel", row)
+    status.Size = UDim2.new(0.35, 0, 1, 0); status.Position = UDim2.new(0.65, 0, 0, 0)
+    status.BackgroundTransparency = 1; status.Font = Enum.Font.GothamMedium; status.TextSize = 11
+    status.Text = "["..feature.GetKey().."]"; status.TextXAlignment = Enum.TextXAlignment.Right
+    KB_RowInstances[feature.Name] = { Frame = row, StatusLabel = status, NameLabel = name }
+end
+
+local function updateKeybindTheme()
+    local theme = Library.Theme; if not theme then return end
+    mainCard.BackgroundColor3 = theme.Background
+    s1.Color = theme.Background
+    local activeAccent = theme.Accent
+    title.TextColor3 = Color3.fromRGB(240, 228, 232)
+    sep.BackgroundColor3 = activeAccent
+    for _, inst in pairs(KB_RowInstances) do inst.StatusLabel.TextColor3 = activeAccent end
+end
+
+table.insert(Library._themeListeners, updateKeybindTheme)
+task.spawn(function() task.wait(1); updateKeybindTheme() end)
+
+task.spawn(function()
+    while task.wait(0.04) do
+        local active = 0
+        for _, feature in ipairs(TrackedKeybinds) do
+            local inst = KB_RowInstances[feature.Name]
+            if inst then
+                if feature.IsActive() then
+                    active = active + 1
+                    inst.StatusLabel.Text = "["..feature.GetKey().."]"
+                    inst.Frame.Visible = true
+                else
+                    inst.Frame.Visible = false
+                end
+            end
+        end
+        local targetH = active == 0 and 28 or 34 + active * 19
+        game:GetService("TweenService"):Create(mainCard,
+            TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            { Size = UDim2.new(0, 180, 0, targetH) }):Play()
+    end
+end)
