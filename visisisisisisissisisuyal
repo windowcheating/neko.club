@@ -1,0 +1,1593 @@
+-- world_visuals.lua — full world feature module (no UI, no toggles)
+-- Verbatim port of NeverLarp's World Visuals code:
+--   Lighting & Time, Atmosphere, Weather (Archnem: Rain/Thunderstorm/Snow/Sandstorm),
+--   Skybox (+ spin), World Textures (+ ForceField map), RTX.
+-- Option A applied: weather defaults to neutral grey tint (no blue-on-first-toggle).
+
+local API = {}
+
+local Services = {
+    Players      = game:GetService("Players"),
+    RunService   = game:GetService("RunService"),
+    TweenService = game:GetService("TweenService"),
+    Lighting     = game:GetService("Lighting"),
+}
+local LocalPlayer = Services.Players.LocalPlayer
+
+local L = Services.Lighting
+local orig = {
+    Brightness = L.Brightness,
+    Ambient    = L.Ambient,
+    Outdoor    = L.OutdoorAmbient,
+    FogEnd     = L.FogEnd,
+    FogStart   = L.FogStart,
+    FogColor   = L.FogColor,
+    Technology = L.Technology,
+    ClockTime  = L.ClockTime,
+    Sky        = L:FindFirstChildOfClass("Sky"),
+}
+
+-- ============================================================
+-- STATE
+-- ============================================================
+local atmos = nil
+local textureVariants = {}
+local textureRestores = {}
+local textureConn = nil
+local currentTexturePack = "minecraft"
+
+local skyboxSpinConn = nil
+local skyboxSpinSpeed = 30
+
+local FFMapConn = nil
+local FFMapConfig = {
+    Enabled = false, Color = Color3.fromRGB(0,170,255),
+    ChangeColor = true, Transparency = 0, CachedParts = {},
+}
+
+local RTXConfig = { Enabled = false, Color = Color3.fromRGB(245,215,225) }
+local RTXOrig = {}
+local RTXTimeForceConn = nil
+local RTXDescAddedConn = nil
+
+-- ============================================================
+-- DATA TABLES
+-- ============================================================
+local SKYBOXES = {
+    Minecraft = {
+        SkyboxUp = "http://www.roblox.com/asset/?id=1876544642",
+        SkyboxBk = "http://www.roblox.com/asset/?id=1876545003",
+        SkyboxLf = "http://www.roblox.com/asset/?id=1876543392",
+        SkyboxDn = "http://www.roblox.com/asset/?id=1876544331",
+        SkyboxFt = "http://www.roblox.com/asset/?id=1876542941",
+        SkyboxRt = "http://www.roblox.com/asset/?id=1876543764",
+    },
+    ["blue space"] = {
+        SkyboxLf = "rbxassetid://15536110634", SkyboxUp = "rbxassetid://15536117282",
+        SkyboxRt = "rbxassetid://15536110634", SkyboxFt = "rbxassetid://15536110634",
+        SkyboxDn = "rbxassetid://15536112543", SkyboxBk = "rbxassetid://15536110634",
+    },
+    pink = {
+        SkyboxUp = "rbxassetid://12216108877", SkyboxLf = "rbxassetid://12216110170",
+        SkyboxRt = "rbxassetid://12216110471", SkyboxFt = "rbxassetid://12216109489",
+        SkyboxBk = "rbxassetid://12216109205", SkyboxDn = "rbxassetid://12216109875",
+    },
+    ["black storm"] = {
+        SkyboxLf = "rbxassetid://15502507918", SkyboxUp = "rbxassetid://15502511911",
+        SkyboxRt = "rbxassetid://15502509398", SkyboxFt = "rbxassetid://15502510289",
+        SkyboxDn = "rbxassetid://15502508460", SkyboxBk = "rbxassetid://15502511288",
+    },
+    realistic = {
+        SkyboxUp = "rbxassetid://653719321", SkyboxDn = "rbxassetid://653718790",
+        SkyboxLf = "rbxassetid://653719190", SkyboxFt = "rbxassetid://653719067",
+        SkyboxRt = "rbxassetid://653718931", SkyboxBk = "rbxassetid://653719502",
+    },
+    custom = {
+        SkyboxBk = "rbxassetid://108929045660200", SkyboxDn = "rbxassetid://78646480540009",
+        SkyboxFt = "rbxassetid://90546017435179", SkyboxLf = "rbxassetid://109838453114563",
+        SkyboxRt = "rbxassetid://94190734796082", SkyboxUp = "rbxassetid://126944775797063",
+    },
+}
+
+local TEXTURE_PACKS = {
+    minecraft = {
+        Slate         = "http://www.roblox.com/asset/?id=8676746437",
+        Grass         = "http://www.roblox.com/asset/?id=9267183930",
+        Sand          = "http://www.roblox.com/asset/?id=12624140843",
+        Wood          = "http://www.roblox.com/asset/?id=3258599312",
+        Brick         = "http://www.roblox.com/asset/?id=10777285622",
+        Concrete      = "http://www.roblox.com/asset/?id=15622710576",
+        CorrodedMetal = "rbxassetid://78612695839404",
+        Metal         = "http://www.roblox.com/asset/?id=121650613091353",
+        WoodPlanks    = "http://www.roblox.com/asset/?id=8676581022",
+    },
+}
+
+-- ============================================================
+-- LIGHTING / TIME / ATMOSPHERE / SKYBOX
+-- ============================================================
+local lightingState = {
+    enabled = false, type = "shadowmap", worldTime = false, hour = 4.5,
+    ambient = false, ambientColor = orig.Ambient, outdoorColor = orig.Outdoor,
+}
+local atmState = {
+    enabled = false, color = Color3.new(1,1,1), decay = Color3.fromRGB(120,120,120),
+    haze = 1, glare = 10, offset = 0, density = 0.35,
+}
+local skyboxState = { enabled = false, type = "realistic" }
+
+local function killCelestialBodies(sky)
+    if not sky then return end
+    pcall(function() sky.CelestialBodiesShown = false end)
+    pcall(function() sky.SunAngularSize = 0 end)
+    pcall(function() sky.MoonAngularSize = 0 end)
+end
+
+local function applySkybox(name)
+    local sky = L:FindFirstChildOfClass("Sky")
+    if not sky then sky = Instance.new("Sky"); sky.Parent = L end
+    local data = SKYBOXES[name]; if not data then return end
+    sky.SkyboxBk = data.SkyboxBk or ""
+    sky.SkyboxDn = data.SkyboxDn or ""
+    sky.SkyboxFt = data.SkyboxFt or ""
+    sky.SkyboxLf = data.SkyboxLf or ""
+    sky.SkyboxRt = data.SkyboxRt or ""
+    sky.SkyboxUp = data.SkyboxUp or ""
+    killCelestialBodies(sky)
+end
+
+local function updateVisuals()
+    if lightingState.enabled then
+        local tech = ({
+            compatibility = Enum.Technology.Compatibility,
+            shadowmap     = Enum.Technology.ShadowMap,
+            future        = Enum.Technology.Future,
+            voxel         = Enum.Technology.Voxel,
+        })[lightingState.type] or Enum.Technology.ShadowMap
+        if L.Technology ~= tech then L.Technology = tech end
+    elseif L.Technology ~= orig.Technology then
+        L.Technology = orig.Technology
+    end
+    if lightingState.worldTime and L.ClockTime ~= lightingState.hour then L.ClockTime = lightingState.hour end
+    if lightingState.ambient then
+        if L.Ambient ~= lightingState.ambientColor then L.Ambient = lightingState.ambientColor end
+        if L.OutdoorAmbient ~= lightingState.outdoorColor then L.OutdoorAmbient = lightingState.outdoorColor end
+    end
+    if atmState.enabled then
+        if not atmos or not atmos.Parent then atmos = Instance.new("Atmosphere"); atmos.Parent = L end
+        atmos.Color = atmState.color; atmos.Decay = atmState.decay
+        atmos.Haze = atmState.haze; atmos.Glare = atmState.glare
+        atmos.Offset = atmState.offset; atmos.Density = atmState.density
+    elseif atmos then
+        atmos:Destroy(); atmos = nil
+    end
+    if skyboxState.enabled then
+        local sky = L:FindFirstChildOfClass("Sky")
+        local data = SKYBOXES[skyboxState.type]
+        if not sky or (data and sky.SkyboxBk ~= data.SkyboxBk) then applySkybox(skyboxState.type) end
+        if sky then killCelestialBodies(sky) end
+    else
+        local sky = L:FindFirstChildOfClass("Sky")
+        if orig.Sky then
+            if sky and sky ~= orig.Sky then sky:Destroy() end
+            if orig.Sky.Parent ~= L then orig.Sky.Parent = L end
+        end
+    end
+end
+
+Services.RunService.Heartbeat:Connect(updateVisuals)
+LocalPlayer.CharacterAdded:Connect(function() task.wait(0.2); updateVisuals() end)
+
+function API:EnableLightingMode(enabled) lightingState.enabled = enabled; updateVisuals() end
+function API:SetLightingType(t) lightingState.type = t; updateVisuals() end
+function API:EnableWorldTime(enabled)
+    lightingState.worldTime = enabled
+    if not enabled then L.ClockTime = orig.ClockTime else updateVisuals() end
+end
+function API:SetWorldTimeHour(h) lightingState.hour = h; updateVisuals() end
+function API:EnableAmbient(enabled)
+    lightingState.ambient = enabled
+    if not enabled then L.Ambient = orig.Ambient; L.OutdoorAmbient = orig.Outdoor else updateVisuals() end
+end
+function API:SetAmbientColor(c) lightingState.ambientColor = c; updateVisuals() end
+function API:SetOutdoorColor(c) lightingState.outdoorColor = c; updateVisuals() end
+
+function API:EnableAtmosphere(enabled) atmState.enabled = enabled; updateVisuals() end
+function API:SetAtmosphereColor(c) atmState.color = c end
+function API:SetAtmosphereDecay(c) atmState.decay = c end
+function API:SetAtmosphereHaze(v) atmState.haze = v end
+function API:SetAtmosphereGlare(v) atmState.glare = v end
+function API:SetAtmosphereOffset(v) atmState.offset = v end
+function API:SetAtmosphereDensity(v) atmState.density = v end
+
+function API:EnableSkybox(enabled) skyboxState.enabled = enabled; updateVisuals() end
+function API:SetSkyboxType(t) skyboxState.type = t; if skyboxState.enabled then applySkybox(t) end end
+
+local function startSkyboxSpin()
+    if skyboxSpinConn then skyboxSpinConn:Disconnect(); skyboxSpinConn = nil end
+    skyboxSpinConn = Services.RunService.Heartbeat:Connect(function(dt)
+        local sky = L:FindFirstChildOfClass("Sky")
+        if not sky then return end
+        killCelestialBodies(sky)
+        sky.SkyboxOrientation = Vector3.new(0, (sky.SkyboxOrientation.Y + skyboxSpinSpeed * dt) % 360, 0)
+    end)
+end
+function API:EnableSkyboxSpin(enabled)
+    if enabled then startSkyboxSpin()
+    else
+        if skyboxSpinConn then skyboxSpinConn:Disconnect(); skyboxSpinConn = nil end
+        local sky = L:FindFirstChildOfClass("Sky")
+        if sky then pcall(function() sky.SkyboxOrientation = Vector3.new(0,0,0) end) end
+    end
+end
+function API:SetSkyboxSpinSpeed(v) skyboxSpinSpeed = v end
+
+-- ============================================================
+-- WORLD TEXTURES
+-- ============================================================
+local function applyTexture(inst)
+    local pack = TEXTURE_PACKS[currentTexturePack]; if not pack then return end
+    if not (inst:IsA("MeshPart") or inst:IsA("Part")) then return end
+    local tex = pack[inst.Material.Name]
+    local isDefault = inst.Color == Color3.fromRGB(254,253,255)
+    if tex or isDefault then
+        if inst.Transparency >= 0.8 then return end
+        if not textureRestores[inst] then
+            textureRestores[inst] = inst.Color
+            inst.Color = Color3.fromRGB(254,253,255)
+        end
+    end
+end
+
+local function applyTextures()
+    for i = 1, #textureVariants do
+        if textureVariants[i] then textureVariants[i]:Destroy(); textureVariants[i] = nil end
+    end
+    textureVariants = {}
+    local matService = game:FindService("MaterialService"); if not matService then return end
+    local pack = TEXTURE_PACKS[currentTexturePack]; if not pack then return end
+    for name, url in pairs(pack) do
+        if name ~= "Glass" then
+            local variant = Instance.new("MaterialVariant")
+            variant.ColorMap = url
+            variant.MetalnessMap = url
+            variant.NormalMap = url
+            variant.RoughnessMap = url
+            variant.BaseMaterial = Enum.Material[name]
+            variant.Name = name
+            variant.StudsPerTile = 5
+            variant.Parent = matService
+            table.insert(textureVariants, variant)
+        end
+    end
+    for _, inst in ipairs(workspace:GetDescendants()) do applyTexture(inst) end
+end
+
+local function removeTextures()
+    for i = 1, #textureVariants do pcall(function() textureVariants[i]:Destroy() end) end
+    textureVariants = {}
+    for inst, col in pairs(textureRestores) do
+        pcall(function() inst.Color = col end)
+        textureRestores[inst] = nil
+    end
+end
+
+function API:EnableTextures(enabled)
+    if enabled then
+        applyTextures()
+        if textureConn then textureConn:Disconnect() end
+        textureConn = workspace.DescendantAdded:Connect(function(inst) applyTexture(inst) end)
+    else
+        if textureConn then textureConn:Disconnect(); textureConn = nil end
+        removeTextures()
+    end
+end
+function API:SetTexturePack(pack)
+    currentTexturePack = pack
+    if textureConn then removeTextures(); applyTextures() end
+end
+
+-- ============================================================
+-- FORCEFIELD MAP
+-- ============================================================
+local function applyFFToPart(part)
+    if not part:IsA("BasePart") then return end
+    if part.Transparency >= 0.95 and part.CanCollide == false then return end
+    if not FFMapConfig.CachedParts[part] then
+        FFMapConfig.CachedParts[part] = {
+            Material = part.Material, Color = part.Color, Transparency = part.Transparency,
+        }
+    end
+    part.Material = Enum.Material.ForceField
+    if FFMapConfig.ChangeColor then part.Color = FFMapConfig.Color end
+    part.Transparency = FFMapConfig.Transparency
+end
+
+local function applyFFMap()
+    local map = workspace:FindFirstChild("FFA_MAP") or workspace:FindFirstChild("Map")
+    if not map then return end
+    for _, inst in ipairs(map:GetDescendants()) do applyFFToPart(inst) end
+    if FFMapConn then FFMapConn:Disconnect() end
+    FFMapConn = map.DescendantAdded:Connect(function(inst)
+        if FFMapConfig.Enabled then task.defer(function() applyFFToPart(inst) end) end
+    end)
+end
+
+local function restoreFFMap()
+    if FFMapConn then FFMapConn:Disconnect(); FFMapConn = nil end
+    for part, data in pairs(FFMapConfig.CachedParts) do
+        if part and part.Parent then
+            pcall(function()
+                part.Material = data.Material
+                part.Color = data.Color
+                part.Transparency = data.Transparency
+            end)
+        end
+    end
+    FFMapConfig.CachedParts = {}
+end
+
+function API:EnableFFMap(enabled)
+    FFMapConfig.Enabled = enabled
+    if enabled then applyFFMap() else restoreFFMap() end
+end
+function API:SetFFMapColor(c)
+    FFMapConfig.Color = c
+    if FFMapConfig.Enabled and FFMapConfig.ChangeColor then
+        for part in pairs(FFMapConfig.CachedParts) do
+            if part and part.Parent then part.Color = c end
+        end
+    end
+end
+function API:SetFFMapChangeColor(v)
+    FFMapConfig.ChangeColor = v
+    if FFMapConfig.Enabled then
+        for part, data in pairs(FFMapConfig.CachedParts) do
+            if part and part.Parent then
+                if v then part.Color = FFMapConfig.Color else part.Color = data.Color end
+            end
+        end
+    end
+end
+function API:SetFFMapTransparency(v)
+    FFMapConfig.Transparency = v
+    if FFMapConfig.Enabled then
+        for part in pairs(FFMapConfig.CachedParts) do
+            if part and part.Parent then part.Transparency = v end
+        end
+    end
+end
+
+-- ============================================================
+-- RTX
+-- ============================================================
+local function addRTXHighlight(part)
+    if part:IsA("BasePart") and not part:FindFirstChild("rtx_highlight") then
+        local h = Instance.new("Highlight")
+        h.Name = "rtx_highlight"; h.Adornee = part
+        h.DepthMode = Enum.HighlightDepthMode.Occluded
+        h.FillTransparency = 1; h.OutlineTransparency = 0.9
+        h.OutlineColor = Color3.fromRGB(0,0,0); h.Parent = part
+    end
+end
+
+local function addRTXLamplight(part)
+    if part:IsA("BasePart") and not part:FindFirstChild("RTX_Light") then
+        local n = part.Name:lower()
+        if n:find("lamp") or n:find("light") or n:find("bulb") or n:find("neon") then
+            local l = Instance.new("PointLight")
+            l.Name = "RTX_Light"; l.Brightness = 2.8; l.Range = 20
+            l.Color = Color3.fromRGB(255,235,210); l.Shadows = true
+            l.Parent = part
+        end
+    end
+end
+
+local function clearRTX()
+    if RTXTimeForceConn then RTXTimeForceConn:Disconnect(); RTXTimeForceConn = nil end
+    if RTXDescAddedConn then RTXDescAddedConn:Disconnect(); RTXDescAddedConn = nil end
+    for _, c in ipairs(L:GetChildren()) do
+        if c.Name == "RTX_Sky" or c.Name == "RTX_SunRays" or c.Name == "RTX_Bloom"
+            or c.Name == "RTX_CC" or c.Name == "RTX_Blur" or c.Name == "RTX_DoF" then
+            c:Destroy()
+        end
+    end
+    for _, inst in ipairs(workspace:GetDescendants()) do
+        local hl = inst:FindFirstChild("rtx_highlight"); if hl then hl:Destroy() end
+        if inst:IsA("BasePart") then
+            local l = inst:FindFirstChild("RTX_Light"); if l then l:Destroy() end
+        end
+    end
+    if RTXOrig.Technology then
+        L.Technology = RTXOrig.Technology
+        L.ClockTime = RTXOrig.ClockTime
+        L.Brightness = RTXOrig.Brightness
+        L.GlobalShadows = RTXOrig.GlobalShadows
+        L.EnvironmentDiffuseScale = RTXOrig.EnvironmentDiffuseScale
+        L.EnvironmentSpecularScale = RTXOrig.EnvironmentSpecularScale
+        L.Ambient = RTXOrig.Ambient
+        L.OutdoorAmbient = RTXOrig.OutdoorAmbient
+        L.FogColor = RTXOrig.FogColor
+        L.FogStart = RTXOrig.FogStart
+        L.FogEnd = RTXOrig.FogEnd
+        L.ColorShift_Top = RTXOrig.ColorShift_Top
+        L.ColorShift_Bottom = RTXOrig.ColorShift_Bottom
+    end
+end
+
+local function updateRTXColor()
+    if not RTXConfig.Enabled then return end
+    L.FogColor = RTXConfig.Color
+    local cc = L:FindFirstChild("RTX_CC")
+    if cc and cc:IsA("ColorCorrectionEffect") then cc.TintColor = RTXConfig.Color end
+end
+
+local function applyRTX()
+    clearRTX()
+    RTXOrig.Technology = L.Technology
+    RTXOrig.ClockTime = L.ClockTime
+    RTXOrig.Brightness = L.Brightness
+    RTXOrig.GlobalShadows = L.GlobalShadows
+    RTXOrig.EnvironmentDiffuseScale = L.EnvironmentDiffuseScale
+    RTXOrig.EnvironmentSpecularScale = L.EnvironmentSpecularScale
+    RTXOrig.Ambient = L.Ambient
+    RTXOrig.OutdoorAmbient = L.OutdoorAmbient
+    RTXOrig.FogColor = L.FogColor
+    RTXOrig.FogStart = L.FogStart
+    RTXOrig.FogEnd = L.FogEnd
+    RTXOrig.ColorShift_Top = L.ColorShift_Top
+    RTXOrig.ColorShift_Bottom = L.ColorShift_Bottom
+
+    L.Technology = Enum.Technology.Future
+    L.ClockTime = 18.5
+    L.Brightness = 2.2
+    L.GlobalShadows = true
+    L.EnvironmentDiffuseScale = 0.8
+    L.EnvironmentSpecularScale = 1
+    L.Ambient = Color3.fromRGB(75,60,65)
+    L.OutdoorAmbient = Color3.fromRGB(120,100,105)
+    L.FogColor = RTXConfig.Color
+    L.FogStart = 0; L.FogEnd = 700
+    L.ColorShift_Top = Color3.fromRGB(35,25,28)
+    L.ColorShift_Bottom = Color3.fromRGB(20,15,18)
+
+    RTXTimeForceConn = L:GetPropertyChangedSignal("ClockTime"):Connect(function()
+        if L.ClockTime ~= 18.5 then L.ClockTime = 18.5 end
+    end)
+
+    local sky = Instance.new("Sky"); sky.Name = "RTX_Sky"
+    sky.SkyboxBk = "rbxassetid://160405144"; sky.SkyboxDn = "rbxassetid://160405144"
+    sky.SkyboxFt = "rbxassetid://160405144"; sky.SkyboxLf = "rbxassetid://160405144"
+    sky.SkyboxRt = "rbxassetid://160405144"; sky.SkyboxUp = "rbxassetid://160405144"
+    sky.MoonAngularSize = 0; sky.SunAngularSize = 0
+    sky.StarCount = 2500; sky.CelestialBodiesShown = false
+    sky.Parent = L
+
+    local rays = Instance.new("SunRaysEffect"); rays.Name = "RTX_SunRays"
+    rays.Intensity = 0; rays.Spread = 0.2; rays.Parent = L
+    local cc = Instance.new("ColorCorrectionEffect"); cc.Name = "RTX_CC"
+    cc.Contrast = 0.08; cc.Saturation = 0.05; cc.Brightness = 0.01
+    cc.TintColor = RTXConfig.Color; cc.Parent = L
+    local blur = Instance.new("BlurEffect"); blur.Name = "RTX_Blur"
+    blur.Size = 0; blur.Parent = L
+    local dof = Instance.new("DepthOfFieldEffect"); dof.Name = "RTX_DoF"
+    dof.InFocusRadius = 160; dof.FocusDistance = 75
+    dof.NearIntensity = 0.1; dof.FarIntensity = 0.2; dof.Parent = L
+
+    Services.TweenService:Create(rays, TweenInfo.new(1), { Intensity = 0.1 }):Play()
+    Services.TweenService:Create(blur, TweenInfo.new(1), { Size = 1 }):Play()
+
+    for _, inst in ipairs(workspace:GetDescendants()) do addRTXHighlight(inst); addRTXLamplight(inst) end
+    RTXDescAddedConn = workspace.DescendantAdded:Connect(function(inst)
+        task.defer(function()
+            if RTXConfig.Enabled then addRTXHighlight(inst); addRTXLamplight(inst) end
+        end)
+    end)
+end
+
+function API:EnableRTX(enabled)
+    RTXConfig.Enabled = enabled
+    if enabled then applyRTX() else clearRTX() end
+end
+function API:SetRTXColor(c) RTXConfig.Color = c; updateRTXColor() end
+
+-- ============================================================
+-- WEATHER ENGINE — Option A: neutral grey tint by default
+-- ============================================================
+local Weather = {}
+do
+    local folder, rig, rigMid, rigFar, boltFolder, impactFolder, dropFolder
+    local flashLight, cc, rainCC, thunderSound, rainSound
+    local splashPart, mistPart, ripplePart
+    local emitters = {}
+    local groundEffects = {}
+    local syncDrops = {}
+    local syncImpactTimer = 0
+    local MAX_GROUND_IMPACTS = 5
+    local SYNC_DROP_COUNT = 6
+    local puddles = {}
+    local MAX_PUDDLES = 10
+    local origFog = { Color = L.FogColor, Start = L.FogStart, End = L.FogEnd }
+    local nextStrike, flash, tAcc = 0, 0, 0
+    local groundUpdateAccumulator = 0
+    local active = {}
+    local activePresetName = "None"
+    -- OPTION A: neutral grey so presets no longer tint the world blue on first toggle
+    local activeColor = Color3.fromRGB(200, 200, 200)
+    local camera = workspace.CurrentCamera
+
+    local TEX_DROP = "rbxasset://textures/particles/sparkles_main.dds"
+    local TEX_SOFT = "rbxasset://textures/particles/smoke_main.dds"
+    local TEX_SMOKE = "rbxasset://textures/particles/smoke_main.dds"
+
+    local function newPart(name, parent)
+        local pt = Instance.new("Part")
+        pt.Name = name; pt.Anchored = true; pt.CanCollide = false
+        pt.Locked = true; pt.Transparency = 1; pt.Massless = true
+        pcall(function() pt.CanQuery = false end)
+        pcall(function() pt.CanTouch = false end)
+        pt.Parent = parent
+        return pt
+    end
+    local function resolveCamera()
+        local c = workspace.CurrentCamera; if c then camera = c end; return camera
+    end
+    local function shade(c, f)
+        return Color3.new(math.clamp(c.R*f,0,1), math.clamp(c.G*f,0,1), math.clamp(c.B*f,0,1))
+    end
+
+    local function ensureRig()
+        if folder and folder.Parent then return true end
+        local cam = resolveCamera(); if not cam then return false end
+        folder = Instance.new("Folder"); folder.Name = "NL_Weather"; folder.Parent = cam
+        rig = newPart("RigNear", folder); rig.Size = Vector3.new(1,1,1)
+        rigMid = newPart("RigMid", folder); rigMid.Size = Vector3.new(1,1,1)
+        rigFar = newPart("RigFar", folder); rigFar.Size = Vector3.new(1,1,1)
+        boltFolder = Instance.new("Folder"); boltFolder.Name = "Bolts"; boltFolder.Parent = folder
+        impactFolder = Instance.new("Folder"); impactFolder.Name = "GroundImpacts"; impactFolder.Parent = folder
+        dropFolder = Instance.new("Folder"); dropFolder.Name = "SynchronizedRainDrops"; dropFolder.Parent = folder
+
+        thunderSound = Instance.new("Sound")
+        thunderSound.Name = "Thunder"
+        thunderSound.SoundId = "rbxassetid://1837730859"
+        thunderSound.Volume = 1; thunderSound.RollOffMaxDistance = 10000
+        pcall(function() thunderSound.RollOffMode = Enum.RollOffMode.Linear end)
+        thunderSound.Parent = rig
+
+        rainSound = Instance.new("Sound")
+        rainSound.Name = "RainAmbient"
+        rainSound.SoundId = "rbxassetid://525368761"
+        rainSound.Volume = 0; rainSound.Looped = true
+        rainSound.RollOffMaxDistance = 10000
+        pcall(function() rainSound.RollOffMode = Enum.RollOffMode.Linear end)
+        rainSound.Parent = rig
+
+        flashLight = Instance.new("PointLight")
+        flashLight.Range = 60; flashLight.Brightness = 0; flashLight.Enabled = false
+        flashLight.Color = Color3.fromRGB(210, 225, 255); flashLight.Parent = rig
+
+        pcall(function()
+            cc = Instance.new("ColorCorrectionEffect"); cc.Name = "NL_Flash"
+            cc.Brightness = 0; cc.Contrast = 0; cc.Saturation = 0
+            cc.Enabled = false; cc.Parent = L
+        end)
+        pcall(function()
+            rainCC = Instance.new("ColorCorrectionEffect"); rainCC.Name = "NL_RainMood"
+            rainCC.Brightness = -0.06; rainCC.Contrast = 0.10; rainCC.Saturation = -0.15
+            rainCC.TintColor = Color3.fromRGB(185, 205, 230)
+            rainCC.Enabled = false; rainCC.Parent = L
+        end)
+        return true
+    end
+
+    local function baseEmitter(kind)
+        local e = Instance.new("ParticleEmitter")
+        e.Name = "W_" .. kind; e.Enabled = false; e.LockedToPart = false; e.Rate = 0
+        pcall(function() e.Shape = Enum.ParticleEmitterShape.Box end)
+        pcall(function() e.ShapeStyle = Enum.ParticleEmitterShapeStyle.Volume end)
+        pcall(function() e.ShapeInOut = Enum.ParticleEmitterShapeInOut.Outward end)
+        e.Parent = rig
+
+        if kind == "RainFront" then
+            e.Texture = TEX_DROP
+            e.Size = NumberSequence.new{
+                NumberSequenceKeypoint.new(0, 0.55), NumberSequenceKeypoint.new(0.05, 0.70),
+                NumberSequenceKeypoint.new(0.86, 0.58), NumberSequenceKeypoint.new(1, 0)
+            }
+            e.Transparency = NumberSequence.new{
+                NumberSequenceKeypoint.new(0, 0.12), NumberSequenceKeypoint.new(0.04, 0.0),
+                NumberSequenceKeypoint.new(0.9, 0.05), NumberSequenceKeypoint.new(1, 1.0)
+            }
+            e.Color = ColorSequence.new{
+                ColorSequenceKeypoint.new(0, Color3.fromRGB(228, 240, 250)),
+                ColorSequenceKeypoint.new(1, Color3.fromRGB(190, 216, 238))
+            }
+            e.Lifetime = NumberRange.new(0.95, 1.25)
+            e.Speed = NumberRange.new(145, 195)
+            e.SpreadAngle = Vector2.new(0.2, 0.2)
+            e.Acceleration = Vector3.new(0, -62, 0)
+            e.LightEmission = 0; e.LightInfluence = 1
+            e.ZOffset = -5
+            e.EmissionDirection = Enum.NormalId.Bottom
+            e.Rotation = NumberRange.new(0, 0)
+            pcall(function() e.Orientation = Enum.ParticleOrientation.VelocityParallel end)
+            pcall(function() e.Squash = NumberSequence.new(-5.5) end)
+        elseif kind == "RainNear" then
+            e.Texture = TEX_DROP
+            e.Size = NumberSequence.new(0.80)
+            e.Transparency = NumberSequence.new{
+                NumberSequenceKeypoint.new(0, 0.15), NumberSequenceKeypoint.new(0.04, 0.0),
+                NumberSequenceKeypoint.new(0.88, 0.0), NumberSequenceKeypoint.new(1, 1.0)
+            }
+            e.Color = ColorSequence.new{
+                ColorSequenceKeypoint.new(0, Color3.fromRGB(224, 238, 250)),
+                ColorSequenceKeypoint.new(1, Color3.fromRGB(196, 220, 240))
+            }
+            e.Lifetime = NumberRange.new(1.05, 1.40)
+            e.Speed = NumberRange.new(130, 178)
+            e.SpreadAngle = Vector2.new(0, 0)
+            e.Acceleration = Vector3.new(0, -54, 0)
+            e.LightEmission = 0; e.LightInfluence = 1
+            e.ZOffset = -3
+            e.EmissionDirection = Enum.NormalId.Bottom
+            e.Rotation = NumberRange.new(0, 0)
+            pcall(function() e.Orientation = Enum.ParticleOrientation.VelocityParallel end)
+            pcall(function() e.Squash = NumberSequence.new(-4.8) end)
+        elseif kind == "RainMid" then
+            e.Texture = TEX_DROP
+            e.Size = NumberSequence.new(0.62)
+            e.Transparency = NumberSequence.new{
+                NumberSequenceKeypoint.new(0, 0.2), NumberSequenceKeypoint.new(0.05, 0.0),
+                NumberSequenceKeypoint.new(0.85, 0.0), NumberSequenceKeypoint.new(1, 1.0)
+            }
+            e.Color = ColorSequence.new{
+                ColorSequenceKeypoint.new(0, Color3.fromRGB(218, 234, 248)),
+                ColorSequenceKeypoint.new(1, Color3.fromRGB(188, 214, 236))
+            }
+            e.Lifetime = NumberRange.new(1.15, 1.55)
+            e.Speed = NumberRange.new(118, 162)
+            e.SpreadAngle = Vector2.new(0.5, 0.5)
+            e.Acceleration = Vector3.new(0, -46, 0)
+            e.LightEmission = 0; e.LightInfluence = 1
+            e.ZOffset = 0
+            e.EmissionDirection = Enum.NormalId.Bottom
+            e.Rotation = NumberRange.new(0, 0)
+            pcall(function() e.Orientation = Enum.ParticleOrientation.VelocityParallel end)
+            pcall(function() e.Squash = NumberSequence.new(-5.8) end)
+        elseif kind == "RainFar" then
+            e.Texture = TEX_DROP
+            e.Size = NumberSequence.new(0.45)
+            e.Transparency = NumberSequence.new{
+                NumberSequenceKeypoint.new(0, 0.25), NumberSequenceKeypoint.new(0.08, 0.05),
+                NumberSequenceKeypoint.new(0.82, 0.08), NumberSequenceKeypoint.new(1, 1.0)
+            }
+            e.Color = ColorSequence.new(Color3.fromRGB(200, 222, 240))
+            e.Lifetime = NumberRange.new(1.30, 1.75)
+            e.Speed = NumberRange.new(105, 148)
+            e.SpreadAngle = Vector2.new(1, 1)
+            e.Acceleration = Vector3.new(0, -40, 0)
+            e.LightEmission = 0; e.LightInfluence = 1
+            e.ZOffset = 4
+            e.EmissionDirection = Enum.NormalId.Bottom
+            pcall(function() e.Orientation = Enum.ParticleOrientation.VelocityParallel end)
+            pcall(function() e.Squash = NumberSequence.new(-6.8) end)
+        elseif kind == "Splash" then
+            e.Texture = TEX_DROP
+            e.Size = NumberSequence.new{
+                NumberSequenceKeypoint.new(0, 0.18), NumberSequenceKeypoint.new(0.3, 0.30),
+                NumberSequenceKeypoint.new(1, 0)
+            }
+            e.Transparency = NumberSequence.new{
+                NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(0.5, 0.25),
+                NumberSequenceKeypoint.new(1, 1)
+            }
+            e.Color = ColorSequence.new(Color3.fromRGB(205, 228, 244))
+            e.Lifetime = NumberRange.new(0.14, 0.28)
+            e.Speed = NumberRange.new(8, 16)
+            e.SpreadAngle = Vector2.new(55, 55)
+            e.Acceleration = Vector3.new(0, -95, 0)
+            e.LightEmission = 0; e.LightInfluence = 1
+            e.EmissionDirection = Enum.NormalId.Top
+            e.Rotation = NumberRange.new(0, 360)
+        elseif kind == "Ripple" then
+            e.Texture = TEX_SOFT
+            e.Size = NumberSequence.new{
+                NumberSequenceKeypoint.new(0, 0.05), NumberSequenceKeypoint.new(0.4, 0.45),
+                NumberSequenceKeypoint.new(1, 0.70)
+            }
+            e.Transparency = NumberSequence.new{
+                NumberSequenceKeypoint.new(0, 0.5), NumberSequenceKeypoint.new(0.3, 0.65),
+                NumberSequenceKeypoint.new(1, 1)
+            }
+            e.Color = ColorSequence.new(Color3.fromRGB(198, 218, 238))
+            e.Lifetime = NumberRange.new(0.45, 0.75)
+            e.Speed = NumberRange.new(0, 0.4)
+            e.SpreadAngle = Vector2.new(0, 0)
+            e.Acceleration = Vector3.new(0, 0, 0)
+            e.LightEmission = 0; e.LightInfluence = 1
+            e.EmissionDirection = Enum.NormalId.Top
+            e.Rotation = NumberRange.new(0, 360)
+        elseif kind == "Mist" then
+            e.Texture = TEX_SOFT
+            e.Size = NumberSequence.new{
+                NumberSequenceKeypoint.new(0, 4), NumberSequenceKeypoint.new(0.5, 8),
+                NumberSequenceKeypoint.new(1, 12)
+            }
+            e.Transparency = NumberSequence.new{
+                NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.2, 0.85),
+                NumberSequenceKeypoint.new(0.7, 0.88), NumberSequenceKeypoint.new(1, 1)
+            }
+            e.Color = ColorSequence.new(Color3.fromRGB(180, 195, 215))
+            e.Lifetime = NumberRange.new(4, 7)
+            e.Speed = NumberRange.new(1, 4)
+            e.SpreadAngle = Vector2.new(180, 180)
+            e.RotSpeed = NumberRange.new(-8, 8)
+            e.Acceleration = Vector3.new(0, 0.3, 0)
+            e.LightEmission = 0.2; e.LightInfluence = 0.7
+            e.EmissionDirection = Enum.NormalId.Top
+            e.Drag = 0.5
+        elseif kind == "Snow" then
+            e.Texture = TEX_SOFT
+            e.Size = NumberSequence.new{
+                NumberSequenceKeypoint.new(0, 0.15), NumberSequenceKeypoint.new(0.5, 0.28),
+                NumberSequenceKeypoint.new(1, 0.2)
+            }
+            e.Transparency = NumberSequence.new{
+                NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.07, 0.05),
+                NumberSequenceKeypoint.new(0.9, 0.12), NumberSequenceKeypoint.new(1, 1)
+            }
+            e.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255))
+            e.Lifetime = NumberRange.new(9, 15)
+            e.Speed = NumberRange.new(5, 11)
+            e.SpreadAngle = Vector2.new(28, 28)
+            e.RotSpeed = NumberRange.new(-35, 35)
+            e.Acceleration = Vector3.new(0, -1.2, 0)
+            e.Drag = 0.4
+            e.LightEmission = 1; e.LightInfluence = 0
+            e.ZOffset = -1
+            e.EmissionDirection = Enum.NormalId.Bottom
+        elseif kind == "SnowFar" then
+            e.Texture = TEX_SOFT
+            e.Size = NumberSequence.new(0.09)
+            e.Transparency = NumberSequence.new{
+                NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.1, 0.4),
+                NumberSequenceKeypoint.new(0.9, 0.45), NumberSequenceKeypoint.new(1, 1)
+            }
+            e.Color = ColorSequence.new(Color3.fromRGB(240, 246, 255))
+            e.Lifetime = NumberRange.new(10, 16)
+            e.Speed = NumberRange.new(4, 9)
+            e.SpreadAngle = Vector2.new(40, 40)
+            e.RotSpeed = NumberRange.new(-25, 25)
+            e.Acceleration = Vector3.new(0, -1, 0)
+            e.LightEmission = 0.9; e.LightInfluence = 0.1
+            e.ZOffset = 3
+            e.EmissionDirection = Enum.NormalId.Bottom
+        else
+            e.Texture = TEX_SMOKE
+            e.Size = NumberSequence.new{
+                NumberSequenceKeypoint.new(0, 7), NumberSequenceKeypoint.new(1, 18)
+            }
+            e.Transparency = NumberSequence.new{
+                NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.2, 0.66),
+                NumberSequenceKeypoint.new(0.8, 0.72), NumberSequenceKeypoint.new(1, 1)
+            }
+            e.Color = ColorSequence.new(Color3.fromRGB(176, 154, 126))
+            e.Lifetime = NumberRange.new(1.8, 3)
+            e.Speed = NumberRange.new(50, 75)
+            e.SpreadAngle = Vector2.new(20, 20)
+            e.RotSpeed = NumberRange.new(-25, 25)
+            e.LightEmission = 0.05; e.LightInfluence = 0.85
+            e.EmissionDirection = Enum.NormalId.Front
+        end
+        return e
+    end
+
+    local function ensureEmitters()
+        if not ensureRig() then return false end
+        for _, k in ipairs({"RainFront","RainNear","RainMid","RainFar","Snow","SnowFar","Sand","Mist"}) do
+            if not emitters[k] or not emitters[k].Parent then
+                emitters[k] = baseEmitter(k)
+                if k == "RainMid" then emitters[k].Parent = rigMid end
+                if k == "RainFar" then emitters[k].Parent = rigFar end
+            end
+        end
+        if not splashPart or not splashPart.Parent then
+            splashPart = newPart("SplashPlane", folder); splashPart.Size = Vector3.new(70, 0.2, 70)
+        end
+        if not emitters.Splash or not emitters.Splash.Parent then
+            local e = baseEmitter("Splash"); e.Parent = splashPart
+            pcall(function() e.Shape = Enum.ParticleEmitterShape.Box end)
+            pcall(function() e.ShapeStyle = Enum.ParticleEmitterShapeStyle.Volume end)
+            emitters.Splash = e
+        end
+        if not ripplePart or not ripplePart.Parent then
+            ripplePart = newPart("RipplePlane", folder); ripplePart.Size = Vector3.new(60, 0.1, 60)
+        end
+        if not emitters.Ripple or not emitters.Ripple.Parent then
+            local e = baseEmitter("Ripple"); e.Parent = ripplePart
+            pcall(function() e.Shape = Enum.ParticleEmitterShape.Box end)
+            pcall(function() e.ShapeStyle = Enum.ParticleEmitterShapeStyle.Surface end)
+            emitters.Ripple = e
+        end
+        if not mistPart or not mistPart.Parent then
+            mistPart = newPart("MistPlane", folder); mistPart.Size = Vector3.new(140, 0.2, 140)
+        end
+        if not emitters.Mist or not emitters.Mist.Parent then emitters.Mist.Parent = mistPart end
+        return true
+    end
+
+    local function spawnBolt()
+        if not boltFolder then return end
+        local origin = camera.CFrame.Position
+        local ang = math.random() * math.pi * 2
+        local dist = 130 + math.random() * 180
+        local top = origin + Vector3.new(math.cos(ang)*dist, 300+math.random(0,120), math.sin(ang)*dist)
+        local bottom = Vector3.new(top.X + math.random(-45,45), origin.Y - 30, top.Z + math.random(-45,45))
+        local prev, parts = top, {}
+        for k = 1, 12 do
+            local a = k / 12
+            local pt = top:Lerp(bottom, a)
+            local jitter = (1 - a) * 22
+            pt = pt + Vector3.new(math.random(-jitter,jitter), 0, math.random(-jitter,jitter))
+            if k == 12 then pt = bottom end
+            local pp = newPart("Bolt", boltFolder)
+            pp.Material = Enum.Material.Neon; pp.Color = Color3.fromRGB(220,235,255); pp.Transparency = 0.05
+            local d = pt - prev; local thick = 1.2 * (1 - a*0.6)
+            pp.Size = Vector3.new(thick, thick, math.max(d.Magnitude, 0.1))
+            pp.CFrame = CFrame.lookAt(prev + d*0.5, pt)
+            table.insert(parts, pp); prev = pt
+            if k > 2 and k < 10 and math.random() < 0.15 then
+                local branchLen = math.random(3, 6); local bprev = pt
+                for b = 1, branchLen do
+                    local bpt = bprev + Vector3.new(math.random(-25,25), -math.random(10,30), math.random(-25,25))
+                    local bp = newPart("Branch", boltFolder)
+                    bp.Material = Enum.Material.Neon; bp.Color = Color3.fromRGB(200,215,245); bp.Transparency = 0.2
+                    local bd = bpt - bprev; local bthick = thick * 0.4
+                    bp.Size = Vector3.new(bthick, bthick, math.max(bd.Magnitude, 0.1))
+                    bp.CFrame = CFrame.lookAt(bprev + bd*0.5, bpt)
+                    table.insert(parts, bp); bprev = bpt
+                end
+            end
+        end
+        task.spawn(function()
+            task.wait(0.04 + math.random()*0.04)
+            for _, pp in ipairs(parts) do pcall(function() pp.Transparency = 0.02 end) end
+            task.wait(0.06)
+            for _, pp in ipairs(parts) do pcall(function() Services.TweenService:Create(pp, TweenInfo.new(0.18), {Transparency = 0.85}):Play() end) end
+            task.wait(0.08)
+            if math.random() < 0.4 then
+                for _, pp in ipairs(parts) do pcall(function() pp.Transparency = 0.35 end) end
+                task.wait(0.05)
+            end
+            for _, pp in ipairs(parts) do pcall(function() Services.TweenService:Create(pp, TweenInfo.new(0.25), {Transparency = 1}):Play() end) end
+            task.wait(0.4)
+            for _, pp in ipairs(parts) do if pp and pp.Parent then pp:Destroy() end end
+        end)
+    end
+
+    local RING_SEGMENTS = 20
+    local RINGS_PER_EFFECT = 3
+    local effectPool = {}
+    local RING_COS, RING_SIN = {}, {}
+    for i = 1, RING_SEGMENTS do
+        local angle = (i - 1) / RING_SEGMENTS * math.pi * 2
+        RING_COS[i] = math.cos(angle); RING_SIN[i] = math.sin(angle)
+    end
+    local RING_CHORD = 2 * math.sin(math.pi / RING_SEGMENTS)
+
+    local function makeSurfaceAxes(normal)
+        local up = normal.Unit
+        local helper = math.abs(up:Dot(Vector3.new(0,1,0))) > 0.95 and Vector3.new(1,0,0) or Vector3.new(0,1,0)
+        local right = helper:Cross(up).Unit
+        local back = right:Cross(up).Unit
+        return right, up, back
+    end
+
+    local function hideEffectParts(effect)
+        for _, ring in ipairs(effect.rings) do
+            ring.active = false
+            for _, segment in ipairs(ring.segments) do
+                if segment and segment.Parent then segment.Transparency = 1 end
+            end
+        end
+        if effect.wetSpot and effect.wetSpot.Parent then effect.wetSpot.Transparency = 1 end
+        if effect.impactFlash and effect.impactFlash.Parent then effect.impactFlash.Transparency = 1 end
+    end
+
+    local function destroyEffectObject(effect)
+        if not effect then return end
+        for _, ring in ipairs(effect.rings or {}) do
+            for _, segment in ipairs(ring.segments or {}) do
+                if segment and segment.Parent then segment:Destroy() end
+            end
+        end
+        if effect.wetSpot and effect.wetSpot.Parent then effect.wetSpot:Destroy() end
+        if effect.impactFlash and effect.impactFlash.Parent then effect.impactFlash:Destroy() end
+        if effect.anchor and effect.anchor.Parent then effect.anchor:Destroy() end
+    end
+
+    local function buildEffectObject()
+        local effect = { rings = {}, owner = impactFolder }
+        for _ = 1, RINGS_PER_EFFECT do
+            local ring = { segments = {}, active = false }
+            for _ = 1, RING_SEGMENTS do
+                local segment = newPart("RippleSegment", impactFolder)
+                segment.Material = Enum.Material.SmoothPlastic
+                segment.Transparency = 1
+                pcall(function() segment.CastShadow = false end)
+                table.insert(ring.segments, segment)
+            end
+            table.insert(effect.rings, ring)
+        end
+        local wetSpot = newPart("WetSpot", impactFolder)
+        wetSpot.Shape = Enum.PartType.Ball; wetSpot.Material = Enum.Material.SmoothPlastic
+        wetSpot.Transparency = 1; pcall(function() wetSpot.CastShadow = false end)
+        effect.wetSpot = wetSpot
+        local impactFlash = newPart("ImpactFlash", impactFolder)
+        impactFlash.Shape = Enum.PartType.Cylinder
+        impactFlash.Material = Enum.Material.SmoothPlastic
+        impactFlash.Transparency = 1; pcall(function() impactFlash.CastShadow = false end)
+        effect.impactFlash = impactFlash
+        local anchor = newPart("RainImpact", impactFolder)
+        anchor.Size = Vector3.new(0.12, 0.12, 0.12)
+        effect.anchor = anchor
+        local splash = Instance.new("ParticleEmitter")
+        splash.Name = "ImpactDroplets"; splash.Texture = TEX_DROP
+        splash.Rate = 0; splash.Enabled = false
+        splash.Size = NumberSequence.new{
+            NumberSequenceKeypoint.new(0, 0.04), NumberSequenceKeypoint.new(0.12, 0.11),
+            NumberSequenceKeypoint.new(0.58, 0.07), NumberSequenceKeypoint.new(1, 0)
+        }
+        splash.Transparency = NumberSequence.new{
+            NumberSequenceKeypoint.new(0, 0.08), NumberSequenceKeypoint.new(0.55, 0.25),
+            NumberSequenceKeypoint.new(1, 1)
+        }
+        splash.SpreadAngle = Vector2.new(38, 38)
+        splash.Acceleration = Vector3.new(0, -50, 0)
+        splash.EmissionDirection = Enum.NormalId.Top
+        splash.RotSpeed = NumberRange.new(-70, 70)
+        splash.LightEmission = 0; splash.LightInfluence = 1
+        pcall(function() splash.Squash = NumberSequence.new(-1.4) end)
+        splash.Parent = anchor
+        effect.splash = splash
+        return effect
+    end
+
+    local function acquireEffect()
+        while #effectPool > 0 do
+            local effect = table.remove(effectPool)
+            if effect.owner == impactFolder and effect.anchor and effect.anchor.Parent then return effect end
+            destroyEffectObject(effect)
+        end
+        return buildEffectObject()
+    end
+
+    local function releaseEffect(effect)
+        if not effect then return end
+        hideEffectParts(effect)
+        if effect.owner == impactFolder and effect.anchor and effect.anchor.Parent then
+            if #effectPool < (MAX_GROUND_IMPACTS + 2) then table.insert(effectPool, effect); return end
+        end
+        destroyEffectObject(effect)
+    end
+
+    local function clearGroundEffects()
+        for i = #groundEffects, 1, -1 do
+            releaseEffect(groundEffects[i]); groundEffects[i] = nil
+        end
+        for i = #puddles, 1, -1 do
+            if puddles[i].part and puddles[i].part.Parent then puddles[i].part:Destroy() end
+            puddles[i] = nil
+        end
+    end
+
+    local function setupRippleRing(effect, index, startRadius, endRadius, delayTime, duration, color, baseTransparency)
+        local ring = effect.rings[index]; if not ring then return end
+        ring.startRadius = startRadius; ring.endRadius = endRadius
+        ring.delay = delayTime; ring.duration = duration
+        ring.color = color; ring.baseTransparency = baseTransparency
+        ring.active = true
+        for _, segment in ipairs(ring.segments) do
+            if segment and segment.Parent then
+                segment.Color = color; segment.Transparency = 1
+            end
+        end
+    end
+
+    local function updateGroundEffects()
+        local now = tick()
+        for i = #groundEffects, 1, -1 do
+            local effect = groundEffects[i]
+            local age = now - effect.started
+            local alive = false
+            for _, ring in ipairs(effect.rings) do
+                if ring.active then
+                    local t = (age - ring.delay) / ring.duration
+                    if t < 0 then
+                        for _, segment in ipairs(ring.segments) do
+                            if segment and segment.Parent then segment.Transparency = 1 end
+                        end
+                    elseif t < 1 then
+                        alive = true
+                        t = math.clamp(t, 0, 1)
+                        local eased = 1 - (1 - t) * (1 - t)
+                        local radius = ring.startRadius + (ring.endRadius - ring.startRadius) * eased
+                        local function smootherstep(x) x = math.clamp(x, 0, 1); return x*x*x*(x*(x*6-15)+10) end
+                        local fadeIn = smootherstep(t / 0.12)
+                        local fadeOut = smootherstep((1 - t) / 0.80)
+                        local tail = smootherstep(1 - t)
+                        local visibility = fadeIn * fadeOut * (0.25 + 0.75 * tail)
+                        local thin = 0.35 + 0.65 * smootherstep(1 - t * 0.85)
+                        local bandWidth = math.max(0.035, radius * 0.078 * thin)
+                        local arcLength = math.max(0.05, RING_CHORD * radius * 1.15)
+                        local segmentSize = Vector3.new(arcLength, 0.03, bandWidth)
+                        local rightAxis, backAxis = effect.right, effect.back
+                        local normalAxis = effect.normal
+                        local basePos = effect.position + normalAxis * 0.025
+                        for index, segment in ipairs(ring.segments) do
+                            if segment and segment.Parent then
+                                local c, sn = RING_COS[index], RING_SIN[index]
+                                local radial = rightAxis * c + backAxis * sn
+                                local tangent = backAxis * c - rightAxis * sn
+                                local position = basePos + radial * radius
+                                segment.Size = segmentSize
+                                segment.CFrame = CFrame.fromMatrix(position, tangent, normalAxis, radial)
+                                local targetTransparency = math.clamp(1 - (1 - ring.baseTransparency) * visibility, 0, 1)
+                                local currentTransparency = segment.Transparency
+                                segment.Transparency = currentTransparency + (targetTransparency - currentTransparency) * 0.45
+                            end
+                        end
+                    else
+                        local stillFading = false
+                        for _, segment in ipairs(ring.segments) do
+                            if segment and segment.Parent then
+                                if segment.Transparency < 0.995 then
+                                    stillFading = true; alive = true
+                                    segment.Transparency = segment.Transparency + (1 - segment.Transparency) * 0.25
+                                else segment.Transparency = 1 end
+                            end
+                        end
+                        if not stillFading then ring.active = false end
+                    end
+                end
+            end
+            if effect.wetSpot and effect.wetSpot.Parent then
+                local wetRaw = math.clamp((age - 0.08) / 2.20, 0, 1)
+                local wetFade = wetRaw*wetRaw*wetRaw*(wetRaw*(wetRaw*6-15)+10)
+                local wetTarget = math.clamp(effect.wetTransparency + wetFade * (1 - effect.wetTransparency), 0, 1)
+                local wetNow = effect.wetSpot.Transparency
+                effect.wetSpot.Transparency = wetNow + (wetTarget - wetNow) * 0.35
+            end
+            if effect.impactFlash and effect.impactFlash.Parent then
+                local flashT = math.clamp(age / 0.45, 0, 1)
+                local flashEase = 1 - (1 - flashT) * (1 - flashT)
+                local flashRadius = 0.05 + flashEase * 0.20
+                effect.impactFlash.Size = Vector3.new(flashRadius*2, 0.025, flashRadius*2)
+                local flashSmooth = flashT*flashT*flashT*(flashT*(flashT*6-15)+10)
+                effect.impactFlash.Transparency = math.clamp(0.12 + flashSmooth * 0.88, 0, 1)
+            end
+            if not alive and age >= effect.life then
+                releaseEffect(effect); table.remove(groundEffects, i)
+            end
+        end
+    end
+
+    local function spawnPuddle(position, normal, right, back, onWater)
+        if onWater or not normal then return end
+        if normal.Y < 0.55 then return end
+        if math.random() > 0.35 then return end
+        for _, existing in ipairs(puddles) do
+            if existing.part and existing.part.Parent then
+                local dx = existing.position.X - position.X
+                local dz = existing.position.Z - position.Z
+                if dx*dx + dz*dz < 4.0 and math.abs(existing.position.Y - position.Y) < 1.5 then
+                    existing.targetRadius = math.min(1.4, existing.targetRadius + 0.08)
+                    existing.started = tick(); return
+                end
+            end
+        end
+        if #puddles >= MAX_PUDDLES then
+            local oldest = table.remove(puddles, 1)
+            if oldest.part and oldest.part.Parent then oldest.part:Destroy() end
+        end
+        local puddle = newPart("Puddle", impactFolder)
+        puddle.Shape = Enum.PartType.Cylinder; puddle.Material = Enum.Material.SmoothPlastic
+        puddle.Color = Color3.fromRGB(175, 205, 230); puddle.Transparency = 0.45
+        puddle.Reflectance = 0
+        pcall(function() puddle.CastShadow = false end)
+        local entry = {
+            part = puddle, normal = normal, right = right, back = back,
+            position = position, started = tick(),
+            targetRadius = 0.40 + math.random()*0.45,
+            growTime = 1.0 + math.random()*0.7,
+            holdTime = 4.0 + math.random()*3.0,
+            fadeTime = 2.2, size = 0.06,
+            baseTransparency = 0.38 + math.random()*0.10,
+        }
+        puddle.Size = Vector3.new(entry.size*2, 0.03, entry.size*2)
+        puddle.CFrame = CFrame.fromMatrix(position + normal*0.015, right, normal, back)
+        table.insert(puddles, entry)
+    end
+
+    local function updatePuddles(dt)
+        local now = tick()
+        for i = #puddles, 1, -1 do
+            local p = puddles[i]; local part = p.part
+            if not part or not part.Parent then table.remove(puddles, i)
+            else
+                local age = now - p.started
+                local total = p.growTime + p.holdTime + p.fadeTime
+                if age >= total then part:Destroy(); table.remove(puddles, i)
+                else
+                    local radius, alpha
+                    if age < p.growTime then
+                        local g = age / p.growTime; g = 1 - (1 - g) * (1 - g)
+                        radius = 0.06 + (p.targetRadius - 0.06) * g
+                        alpha = math.clamp(age / 0.30, 0, 1)
+                    elseif age < p.growTime + p.holdTime then
+                        radius = p.targetRadius; alpha = 1
+                    else
+                        local f = math.clamp((age - p.growTime - p.holdTime) / p.fadeTime, 0, 1)
+                        radius = p.targetRadius * (1 - f*0.25); alpha = 1 - f
+                    end
+                    p.size = radius
+                    part.Size = Vector3.new(radius*2, 0.035, radius*2)
+                    part.CFrame = CFrame.fromMatrix(p.position + p.normal*0.02, p.right, p.normal, p.back)
+                    part.Transparency = p.baseTransparency + (1 - alpha)*(1 - p.baseTransparency)*0.92
+                end
+            end
+        end
+    end
+
+    local function spawnGroundImpactAtHit(hit)
+        if not hit or not impactFolder or not impactFolder.Parent then return end
+        pcall(function()
+            if #groundEffects >= MAX_GROUND_IMPACTS then
+                local oldest = table.remove(groundEffects, 1); releaseEffect(oldest)
+            end
+            local right, normal, back = makeSurfaceAxes(hit.Normal)
+            local position = hit.Position + normal * 0.035
+            local onWater = hit.Material == Enum.Material.Water
+            local effect = acquireEffect()
+            effect.position = position; effect.normal = normal
+            effect.right = right; effect.back = back
+            effect.started = tick()
+            effect.life = onWater and 13.50 or 12.50
+            effect.wetTransparency = onWater and 0.25 or 0.32
+
+            local tint = activeColor
+            local rippleColor
+            if tint then
+                rippleColor = Color3.new(
+                    math.clamp(tint.R*0.95+0.05, 0, 1),
+                    math.clamp(tint.G*0.95+0.05, 0, 1),
+                    math.clamp(tint.B*0.95+0.05, 0, 1)
+                )
+            else
+                rippleColor = onWater and Color3.fromRGB(196, 222, 240) or Color3.fromRGB(206, 228, 244)
+            end
+            if onWater then
+                setupRippleRing(effect, 1, 0.04, 0.55, 0.00, 4.00, rippleColor, 0.02)
+                setupRippleRing(effect, 2, 0.10, 2.10, 0.00, 9.00, rippleColor, 0.08)
+                setupRippleRing(effect, 3, 0.20, 3.70, 0.90, 12.00, rippleColor, 0.14)
+            else
+                setupRippleRing(effect, 1, 0.04, 0.46, 0.00, 3.50, rippleColor, 0.02)
+                setupRippleRing(effect, 2, 0.09, 1.55, 0.00, 8.00, rippleColor, 0.10)
+                setupRippleRing(effect, 3, 0.18, 2.75, 0.80, 10.50, rippleColor, 0.16)
+            end
+            local wetSpot = effect.wetSpot
+            if wetSpot and wetSpot.Parent then
+                wetSpot.Color = tint and shade(tint, 0.85) or (onWater and Color3.fromRGB(150,190,220) or Color3.fromRGB(170,198,218))
+                wetSpot.Transparency = effect.wetTransparency
+                wetSpot.Size = onWater and Vector3.new(0.04,0.42,0.42) or Vector3.new(0.04,0.32,0.32)
+                wetSpot.CFrame = CFrame.fromMatrix(position + normal*0.018, right, normal, back)
+            end
+            local impactFlash = effect.impactFlash
+            if impactFlash and impactFlash.Parent then
+                impactFlash.Color = tint or (onWater and Color3.fromRGB(205,230,246) or Color3.fromRGB(215,235,248))
+                impactFlash.Transparency = 0.12
+                impactFlash.Size = Vector3.new(0.16, 0.025, 0.16)
+                impactFlash.CFrame = CFrame.fromMatrix(position + normal*0.045, right, normal, back)
+            end
+            if effect.anchor and effect.anchor.Parent then
+                effect.anchor.CFrame = CFrame.fromMatrix(position, right, normal, back)
+            end
+            local splash = effect.splash
+            if splash and splash.Parent then
+                splash.Color = ColorSequence.new(tint or (onWater and Color3.fromRGB(196,222,242) or Color3.fromRGB(208,230,246)))
+                splash.Lifetime = onWater and NumberRange.new(0.18,0.34) or NumberRange.new(0.15,0.28)
+                splash.Speed = NumberRange.new(3,8)
+                splash:Emit(2)
+            end
+            spawnPuddle(position, normal, right, back, onWater)
+            table.insert(groundEffects, effect)
+        end)
+    end
+
+    local function destroySyncDrops()
+        for _, drop in ipairs(syncDrops) do
+            if drop.part and drop.part.Parent then drop.part:Destroy() end
+        end
+        syncDrops = {}; syncImpactTimer = 0
+    end
+
+    local function ensureSyncDrops()
+        if not dropFolder or not dropFolder.Parent then return end
+        while #syncDrops < SYNC_DROP_COUNT do
+            local part = newPart("SyncedRainDrop", dropFolder)
+            part.Material = Enum.Material.SmoothPlastic
+            part.Transparency = 0.38
+            pcall(function() part.CastShadow = false end)
+            table.insert(syncDrops, {
+                part = part, position = nil, velocity = Vector3.zero,
+                targetHit = nil, impactTime = nil, age = 0, maxAge = 0.95,
+            })
+        end
+    end
+
+    local function resetSyncDrop(drop, base, dir, strength, rayParams)
+        local angle = math.random() * math.pi * 2
+        local distance = math.sqrt(math.random()) * 72
+        local height = 62 + math.random() * 48
+        local offset = Vector3.new(math.cos(angle)*distance, height, math.sin(angle)*distance)
+        local wind = dir * (strength * (0.08 + math.random()*0.12))
+        local startSpeed = math.max(10, 70) * (1.35 + math.random()*0.40)
+        drop.position = base + offset - wind * 0.35
+        drop.velocity = Vector3.new(wind.X*0.15, -startSpeed, wind.Z*0.15)
+        drop.targetHit = nil; drop.impactTime = nil; drop.age = 0; drop.maxAge = 0.95
+        if rayParams then
+            local ray = workspace:Raycast(drop.position, Vector3.new(0,-2500,0), rayParams)
+            if ray and ray.Position.Y < drop.position.Y - 1 then
+                drop.targetHit = { Position = ray.Position, Normal = ray.Normal, Material = ray.Material }
+                local fallDistance = math.max(drop.position.Y - ray.Position.Y, 1)
+                local gravity = 38
+                local disc = startSpeed*startSpeed + 2*gravity*fallDistance
+                drop.impactTime = math.max(0.10, (-startSpeed + math.sqrt(disc)) / gravity)
+                drop.maxAge = drop.impactTime + 0.08
+            end
+        end
+        if drop.part and drop.part.Parent then
+            drop.part.Transparency = 0.32 + math.random()*0.16
+            drop.part.Size = Vector3.new(0.022, 0.022, 1.0)
+            drop.part.CFrame = CFrame.lookAt(drop.position, drop.position + drop.velocity)
+        end
+    end
+
+    local sharedRayParams = RaycastParams.new()
+    sharedRayParams.FilterType = Enum.RaycastFilterType.Exclude
+    sharedRayParams.IgnoreWater = false
+    local sharedIgnoreChar = nil
+    local function refreshRayParams()
+        local char = Services.Players.LocalPlayer.Character
+        if sharedIgnoreChar ~= char or not sharedRayParams.FilterDescendantsInstances[1] then
+            sharedIgnoreChar = char
+            local ignore = { folder }
+            if char then table.insert(ignore, char) end
+            sharedRayParams.FilterDescendantsInstances = ignore
+        end
+        return sharedRayParams
+    end
+
+    local function updateSynchronizedRain(dt, base, dir, strength, groundFX)
+        if not groundFX then destroySyncDrops(); return end
+        local isRain = (active.rainNear or 0) > 0
+        if not isRain then destroySyncDrops(); return end
+        ensureSyncDrops()
+        syncImpactTimer = math.max(0, syncImpactTimer - dt)
+        local rainColor = activeColor or Color3.fromRGB(198, 220, 240)
+        local params = refreshRayParams()
+        for _, drop in ipairs(syncDrops) do
+            if not drop.position then resetSyncDrop(drop, base, dir, strength, params) end
+            local previous = drop.position
+            drop.age = drop.age + dt
+            drop.velocity = drop.velocity + Vector3.new(dir.X*strength*0.008, -38, dir.Z*strength*0.008) * dt
+            local nextPosition = previous + drop.velocity * dt
+            local hit = nil
+            if groundFX then
+                if drop.targetHit and drop.impactTime and drop.age >= drop.impactTime then
+                    hit = drop.targetHit
+                else
+                    local collision = workspace:Raycast(previous, nextPosition - previous, params)
+                    if collision then
+                        hit = { Position = collision.Position, Normal = collision.Normal, Material = collision.Material }
+                    end
+                end
+            end
+            if hit then
+                if syncImpactTimer <= 0 then spawnGroundImpactAtHit(hit); syncImpactTimer = 0.35 end
+                resetSyncDrop(drop, base, dir, strength, params)
+            else
+                drop.position = nextPosition
+                if drop.age >= drop.maxAge or drop.position.Y < base.Y - 80 then
+                    resetSyncDrop(drop, base, dir, strength, params)
+                else
+                    local travel = nextPosition - previous
+                    local travelLength = math.clamp(travel.Magnitude * 3.0, 0.65, 2.8)
+                    local velocityUnit = drop.velocity.Magnitude > 0 and drop.velocity.Unit or Vector3.new(0,-1,0)
+                    local midpoint = nextPosition - velocityUnit * (travelLength * 0.35)
+                    drop.part.Color = rainColor
+                    drop.part.Size = Vector3.new(0.022, 0.022, travelLength)
+                    drop.part.CFrame = CFrame.lookAt(midpoint, midpoint + drop.velocity)
+                    drop.part.Transparency = 0.32 + math.clamp(drop.age / drop.maxAge, 0, 1) * 0.18
+                end
+            end
+        end
+    end
+
+    local function restoreFog()
+        pcall(function()
+            L.FogColor = origFog.Color; L.FogStart = origFog.Start; L.FogEnd = origFog.End
+        end)
+    end
+
+    local PRESETS = {
+        None = {},
+        Rain = { rainFront=60, rainNear=120, rainMid=170, rainFar=230,
+            wind=10, fog=1800, fogColor=Color3.fromRGB(140,155,178),
+            moodBrightness=-0.06, moodSaturation=-0.15 },
+        Thunderstorm = { rainFront=100, rainNear=200, rainMid=280, rainFar=380,
+            wind=38, fog=1100, fogColor=Color3.fromRGB(105,118,138),
+            lightning=2.5, moodBrightness=-0.10, moodSaturation=-0.25 },
+        Snow = { snow=620, snowFar=900, wind=6, fog=1000,
+            fogColor=Color3.fromRGB(220,230,242),
+            moodBrightness=-0.02, moodSaturation=-0.05 },
+        Sandstorm = { sand=420, wind=70, fog=220,
+            fogColor=Color3.fromRGB(170,150,124),
+            moodBrightness=-0.03, moodSaturation=-0.1 },
+    }
+    active = PRESETS.None
+
+    function Weather.applyPreset(name, colorOverride)
+        activePresetName = name or "None"
+        active = PRESETS[activePresetName] or PRESETS.None
+        -- Option A: only override activeColor if a real color was passed in;
+        -- otherwise keep the neutral grey we initialised above.
+        if colorOverride ~= nil then
+            activeColor = colorOverride
+        end
+        if activePresetName == "None" then
+            for _, e in pairs(emitters) do
+                if e and e.Parent then e.Enabled = false; e.Rate = 0 end
+            end
+            if flashLight then flashLight.Enabled = false; flashLight.Brightness = 0 end
+            if cc then cc.Enabled = false; cc.Brightness = 0 end
+            if rainCC then rainCC.Enabled = false end
+            if boltFolder then boltFolder:ClearAllChildren() end
+            pcall(function() if thunderSound then thunderSound:Stop() end end)
+            pcall(function() if rainSound then rainSound:Stop(); rainSound.Volume = 0 end end)
+            flash = 0
+            clearGroundEffects(); destroySyncDrops(); restoreFog()
+            return
+        end
+        if not ensureEmitters() then
+            warn("[WorldVis][Weather] camera not ready"); return
+        end
+        local rates = {
+            RainFront = active.rainFront, RainNear = active.rainNear,
+            RainMid = active.rainMid, RainFar = active.rainFar,
+            Snow = active.snow, SnowFar = active.snowFar, Sand = active.sand,
+        }
+        for eName, e in pairs(emitters) do
+            if e and e.Parent then
+                local rate = rates[eName] or 0
+                e.Rate = rate; e.Enabled = rate > 0
+            end
+        end
+        local rainColor = activeColor or Color3.fromRGB(198, 220, 240)
+        local rainDark = shade(rainColor, 0.85)
+        local rainLight = shade(rainColor, 1.12)
+        if emitters.RainFront then
+            emitters.RainFront.Color = ColorSequence.new{
+                ColorSequenceKeypoint.new(0, rainLight), ColorSequenceKeypoint.new(1, rainDark)
+            }
+        end
+        if emitters.RainNear then
+            emitters.RainNear.Color = ColorSequence.new{
+                ColorSequenceKeypoint.new(0, rainLight), ColorSequenceKeypoint.new(1, rainColor)
+            }
+        end
+        if emitters.RainMid then
+            emitters.RainMid.Color = ColorSequence.new{
+                ColorSequenceKeypoint.new(0, rainLight), ColorSequenceKeypoint.new(1, rainColor)
+            }
+        end
+        if emitters.RainFar then emitters.RainFar.Color = ColorSequence.new(rainColor) end
+        if emitters.Splash then emitters.Splash.Color = ColorSequence.new(rainColor) end
+        if emitters.Ripple then emitters.Ripple.Color = ColorSequence.new(rainColor) end
+        if emitters.Snow and activeColor then emitters.Snow.Color = ColorSequence.new(activeColor) end
+        if emitters.SnowFar and activeColor then emitters.SnowFar.Color = ColorSequence.new(shade(activeColor, 0.94)) end
+        if emitters.Sand and activeColor then emitters.Sand.Color = ColorSequence.new(activeColor) end
+        if emitters.Mist and activeColor then emitters.Mist.Color = ColorSequence.new(shade(activeColor, 0.9)) end
+        local rainSpeed = 70
+        if active.rainNear then
+            if emitters.RainFront then emitters.RainFront.Speed = NumberRange.new(rainSpeed*1.15, rainSpeed*1.55) end
+            if emitters.RainNear then emitters.RainNear.Speed = NumberRange.new(rainSpeed*1.00, rainSpeed*1.35) end
+            if emitters.RainMid then emitters.RainMid.Speed = NumberRange.new(rainSpeed*0.90, rainSpeed*1.20) end
+            if emitters.RainFar then emitters.RainFar.Speed = NumberRange.new(rainSpeed*0.80, rainSpeed*1.08) end
+        end
+        if active.fog then
+            pcall(function()
+                L.FogColor = activeColor and shade(activeColor, 0.72) or active.fogColor
+                L.FogStart = 0; L.FogEnd = active.fog
+            end)
+        else restoreFog() end
+        if rainCC then
+            rainCC.Enabled = true
+            rainCC.Brightness = active.moodBrightness or -0.06
+            rainCC.Saturation = active.moodSaturation or -0.15
+            rainCC.Contrast = 0.10
+            rainCC.TintColor = activeColor and shade(activeColor, 0.88) or Color3.fromRGB(185,205,230)
+        end
+        if rainSound and rainSound.Parent then
+            pcall(function()
+                rainSound.Volume = 0
+                rainSound:Play()
+                Services.TweenService:Create(rainSound, TweenInfo.new(2), {Volume = 1.2}):Play()
+            end)
+        end
+        nextStrike = tick() + (active.lightning or 999)
+    end
+
+    function Weather.refresh() Weather.applyPreset(activePresetName, activeColor) end
+
+    function Weather.step(dt)
+        local cam = resolveCamera(); if not cam then return end
+        camera = cam
+        if not (rig and rig.Parent) then ensureEmitters() end
+        tAcc = tAcc + dt
+        local base = camera.CFrame.Position
+        local windPhase = tAcc * 0.08
+        local windNoise1 = math.noise(windPhase, 0, 0)
+        local windNoise2 = math.noise(windPhase * 0.3, 50, 0)
+        local gustStrength = 1 + math.max(0, math.noise(windPhase*1.5, 100, 0)) * 1.8
+        local dir = CFrame.Angles(0, windPhase + windNoise1*1.2, 0).LookVector
+        local strength = (active.wind or 0) * gustStrength * (0.7 + windNoise2*0.6)
+
+        if (active.sand or 0) > 0 then
+            rig.Size = Vector3.new(180, 100, 14)
+            rig.CFrame = CFrame.lookAt(base - dir*80 + Vector3.new(0,10,0), base + dir*10)
+            if rigMid then rigMid.CFrame = rig.CFrame end
+            if rigFar then rigFar.CFrame = rig.CFrame end
+        elseif (active.snow or 0) > 0 or (active.snowFar or 0) > 0 then
+            rig.Size = Vector3.new(150, 26, 150)
+            rig.CFrame = CFrame.new(base + Vector3.new(0,34,0) - dir*strength*0.4)
+            if rigMid then rigMid.CFrame = rig.CFrame end
+            if rigFar then rigFar.CFrame = rig.CFrame end
+        else
+            rig.Size = Vector3.new(140, 10, 140)
+            rig.CFrame = CFrame.new(base + Vector3.new(0,45,0) - dir*strength*0.35)
+            if rigMid then
+                rigMid.Size = Vector3.new(200, 12, 200)
+                rigMid.CFrame = CFrame.new(base + Vector3.new(0,56,0) - dir*strength*0.5)
+            end
+            if rigFar then
+                rigFar.Size = Vector3.new(280, 15, 280)
+                rigFar.CFrame = CFrame.new(base + Vector3.new(0,68,0) - dir*strength*0.65)
+            end
+        end
+
+        local groundY = base.Y - 10
+        pcall(function()
+            local rp = RaycastParams.new()
+            rp.FilterType = Enum.RaycastFilterType.Exclude
+            rp.FilterDescendantsInstances = { folder, Services.Players.LocalPlayer.Character }
+            local hit = workspace:Raycast(base + Vector3.new(0,5,0), Vector3.new(0,-300,0), rp)
+            if hit then groundY = hit.Position.Y + 0.1 end
+        end)
+
+        pcall(updateSynchronizedRain, dt, base, dir, strength, true)
+        groundUpdateAccumulator = groundUpdateAccumulator + dt
+        if groundUpdateAccumulator >= (1/24) then
+            local gdt = groundUpdateAccumulator
+            groundUpdateAccumulator = 0
+            pcall(updateGroundEffects); pcall(updatePuddles, gdt)
+        end
+        if splashPart and splashPart.Parent and (active.splash or 0) > 0 then
+            splashPart.CFrame = CFrame.new(base.X, groundY, base.Z)
+        end
+        if ripplePart and ripplePart.Parent and (active.ripple or 0) > 0 then
+            ripplePart.CFrame = CFrame.new(base.X, groundY + 0.05, base.Z)
+        end
+        if mistPart and mistPart.Parent and (active.mist or 0) > 0 then
+            mistPart.CFrame = CFrame.new(base.X, groundY + 2, base.Z)
+        end
+
+        for kind, e in pairs(emitters) do
+            if e and e.Parent and e.Enabled then
+                local wf, g
+                if kind == "RainFront" then wf=0.10; g=-62
+                elseif kind == "RainNear" then wf=0.14; g=-54
+                elseif kind == "RainMid" then wf=0.22; g=-46
+                elseif kind == "RainFar" then wf=0.34; g=-40
+                elseif kind == "Snow" or kind == "SnowFar" then wf=1.6; g=-1.2
+                elseif kind == "Sand" then wf=1.1; g=-2
+                elseif kind == "Mist" then wf=0.15; g=0.3
+                else wf=0; g=0 end
+                if kind ~= "Splash" and kind ~= "Ripple" then
+                    e.Acceleration = Vector3.new(dir.X*strength*wf, g, dir.Z*strength*wf)
+                end
+            end
+        end
+        if active.lightning and tick() >= nextStrike then
+            flash = 0.65
+            if flashLight then flashLight.Enabled = true end
+            spawnBolt()
+            if math.random() < 0.35 then task.delay(0.08 + math.random()*0.1, spawnBolt) end
+            task.delay(0.3 + math.random()*1.2, function()
+                pcall(function()
+                    if thunderSound and thunderSound.Parent then
+                        thunderSound.Volume = 0.7 + math.random()*0.4
+                        thunderSound.PlaybackSpeed = 0.8 + math.random()*0.35
+                        thunderSound:Play()
+                    end
+                end)
+            end)
+            nextStrike = tick() + active.lightning * (0.5 + math.random()*0.8)
+        end
+        if flash > 0 then
+            flash = math.max(0, flash - dt * 2.2)
+            if flashLight then
+                flashLight.Enabled = flash > 0.01
+                flashLight.Brightness = flash * 16
+                flashLight.Range = 60 + flash * 160
+            end
+            if cc then
+                cc.Enabled = flash > 0.01
+                cc.Brightness = flash * 0.5
+            end
+        end
+    end
+
+    function Weather.destroy()
+        if folder then pcall(function() folder:Destroy() end) end
+        if cc then pcall(function() cc:Destroy() end) end
+        if rainCC then pcall(function() rainCC:Destroy() end) end
+        pcall(function() if thunderSound then thunderSound:Stop() end end)
+        pcall(function() if rainSound then rainSound:Stop() end end)
+        folder, rig, rigMid, rigFar, boltFolder, impactFolder, dropFolder = nil, nil, nil, nil, nil, nil, nil
+        flashLight, cc, rainCC, thunderSound, rainSound = nil, nil, nil, nil, nil
+        splashPart, mistPart, ripplePart = nil, nil, nil
+        clearGroundEffects(); groundEffects = {}; destroySyncDrops()
+        emitters = {}; restoreFog()
+    end
+
+    Weather.conn = Services.RunService.RenderStepped:Connect(function(dt)
+        local ok, err = pcall(Weather.step, dt)
+        if not ok then warn("[WorldVis][Weather]", err) end
+    end)
+
+    function Weather.setColor(c)
+        activeColor = c
+        if activePresetName ~= "None" then Weather.applyPreset(activePresetName, c) end
+    end
+end
+
+function API:SetWeather(preset, color)
+    if Weather and Weather.applyPreset then
+        local ok, err = pcall(Weather.applyPreset, preset, color)
+        if not ok then warn("[WorldVis][Weather] " .. tostring(err)) end
+    end
+end
+function API:SetWeatherColor(c)
+    if Weather and Weather.setColor then
+        local ok, err = pcall(Weather.setColor, c)
+        if not ok then warn("[WorldVis][Weather] " .. tostring(err)) end
+    end
+end
+
+-- ============================================================
+-- DESTROY
+-- ============================================================
+function API:Destroy()
+    if atmos and atmos.Parent then atmos:Destroy() end
+    atmos = nil
+    if textureConn then textureConn:Disconnect(); textureConn = nil end
+    removeTextures()
+    if FFMapConn then FFMapConn:Disconnect(); FFMapConn = nil end
+    restoreFFMap()
+    if RTXConfig.Enabled then clearRTX() end
+    if skyboxSpinConn then skyboxSpinConn:Disconnect(); skyboxSpinConn = nil end
+    if Weather and Weather.destroy then pcall(Weather.destroy) end
+end
+
+return API
